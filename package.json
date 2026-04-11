@@ -4,31 +4,37 @@
     "type": "module",
     "main": "dist/index.js",
     "module": "dist/index.js",
-    "types": "src/index.d.ts",
+    "types": "dist/index.d.ts",
     "exports": {
         "./package.json": "./package.json",
         ".": {
             "import": {
                 "@elizaos/source": "./src/index.ts",
-                "types": "./src/index.d.ts",
+                "types": "./dist/index.d.ts",
                 "default": "./dist/index.js"
             }
         }
     },
     "files": [
-        "dist",
-        "src/index.d.ts"
+        "dist"
     ],
     "dependencies": {
-        "@elizaos/client-airi3": "workspace:*",
-        "@elizaos/core": "workspace:*"
+        "@elizaos/core": "workspace:*",
+        "cors": "^2.8.5",
+        "express": "^4.21.2",
+        "uuid": "^9.0.0",
+        "ws": "^8.18.0"
     },
     "devDependencies": {
+        "@types/cors": "^2.8.17",
+        "@types/express": "^5.0.0",
+        "@types/uuid": "^9.0.0",
+        "@types/ws": "^8.5.14",
         "tsup": "8.3.5"
     },
     "scripts": {
-        "build": "tsup --format esm",
-        "dev": "tsup --format esm --watch"
+        "build": "tsup --format esm --dts",
+        "dev": "tsup --format esm --dts --watch"
     },
     "publishConfig": {
         "access": "public"
