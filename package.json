@@ -1,0 +1,36 @@
+{
+    "name": "@elizaos/client-airifica",
+    "version": "0.25.6-alpha.1",
+    "type": "module",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "types": "src/index.d.ts",
+    "exports": {
+        "./package.json": "./package.json",
+        ".": {
+            "import": {
+                "@elizaos/source": "./src/index.ts",
+                "types": "./src/index.d.ts",
+                "default": "./dist/index.js"
+            }
+        }
+    },
+    "files": [
+        "dist",
+        "src/index.d.ts"
+    ],
+    "dependencies": {
+        "@elizaos/client-airi3": "workspace:*",
+        "@elizaos/core": "workspace:*"
+    },
+    "devDependencies": {
+        "tsup": "8.3.5"
+    },
+    "scripts": {
+        "build": "tsup --format esm",
+        "dev": "tsup --format esm --watch"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}
