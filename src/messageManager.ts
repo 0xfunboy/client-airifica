@@ -147,6 +147,8 @@ const MARKET_SYMBOL_STOPWORDS = new Set([
 ]);
 
 const MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|wallet|position|positions|portfolio|pnl|fundamental|fundamentals|tokenomics|pacifica|jupiter|perp|spot)\b/i;
+const ACTION_MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|fundamental|fundamentals|tokenomics|jupiter|perp|spot)\b/i;
+const ACCOUNT_INTENT_PATTERN = /\b(open position|open positions|position|positions|portfolio|account|equity|available|withdrawable|margin|pnl|profit|loss|liquidation|liq|exposure|ready to trade|risk|overexposed|close now|hold now|reduce risk|execution state)\b/i;
 const CONVERSATIONAL_FAST_PATH_PATTERN = /\b(hi|hello|hey|yo|gm|gn|good morning|good evening|good night|how are you|how's it going|how is it going|what's up|whats up|who are you|thanks|thank you|ok|okay|cool|nice|great|perfect|understood|got it|help me|help)\b/i;
 
 const TOKEN_ALIAS_OVERRIDES: Record<string, string> = {
@@ -184,6 +186,51 @@ type RoutedActionPlan = {
     raw: string;
     source: "deterministic" | "llm";
     candidateActions: string[];
+};
+
+type PacificaKnowledgePayload = {
+    pacifica_status?: {
+        readyToExecute?: boolean;
+        hasBinding?: boolean;
+        builderApproved?: boolean;
+        agentBound?: boolean;
+        isActive?: boolean;
+        agentWalletPublicKey?: string;
+        pacificaAccount?: string;
+        builderCode?: string;
+    } | null;
+    pacifica_account?: {
+        equity_usd?: number;
+        available_to_spend_usd?: number;
+        available_to_withdraw_usd?: number;
+        total_margin_used_usd?: number;
+        positions_count?: number;
+        orders_count?: number;
+        stop_orders_count?: number;
+        maker_fee_rate?: number;
+        taker_fee_rate?: number;
+        updated_at?: number;
+    } | null;
+    account_missing?: boolean;
+    onboarding_hint?: string | null;
+    minimum_deposit_usd?: number | null;
+    open_positions?: Array<{
+        symbol?: string;
+        side?: string;
+        amount?: number;
+        entry_price?: number;
+        mark_price?: number;
+        take_profit_price?: number;
+        stop_loss_price?: number;
+        liquidation_price?: number;
+        notional_usd?: number;
+        margin_usd?: number;
+        funding_rate?: number;
+        unrealized_pnl_usd?: number;
+        unrealized_pnl_pct?: number;
+        isolated?: boolean;
+        updated_at?: number;
+    }>;
 };
 
 /**
@@ -465,6 +512,109 @@ export class AirificaMessageManager {
             return false;
 
         return CONVERSATIONAL_FAST_PATH_PATTERN.test(raw) || raw.split(/\s+/).length <= 8;
+    }
+
+    private hasPotentialActionMarketIntent(text: string) {
+        const raw = String(text || "").trim();
+        if (!raw)
+            return false;
+
+        if (ACTION_MARKET_INTENT_PATTERN.test(raw))
+            return true;
+
+        if (this.extractOverrideAddresses(raw).length > 0)
+            return true;
+
+        if (this.extractUniqueMatches(raw, EVM_ADDRESS_PATTERN).length > 0)
+            return true;
+
+        if (this.extractUniqueMatches(raw, BASE58_ADDRESS_PATTERN).length > 0)
+            return true;
+
+        if (this.extractExplicitTickers(raw).length > 0)
+            return true;
+
+        const plainSymbols: string[] = raw.match(/\b[A-Za-z]{2,10}\b/g) || [];
+        return plainSymbols.some((symbol) => MARKET_SYMBOL_ALIASES.has(symbol.toLowerCase()));
+    }
+
+    private hasPotentialAccountIntent(text: string) {
+        const raw = String(text || "").trim();
+        if (!raw)
+            return false;
+
+        return ACCOUNT_INTENT_PATTERN.test(raw);
+    }
+
+    private parsePacificaKnowledge(raw: string | null | undefined): PacificaKnowledgePayload | null {
+        const parsed = this.safeParseJson(String(raw || ""));
+        if (!parsed || typeof parsed !== "object")
+            return null;
+
+        return parsed as PacificaKnowledgePayload;
+    }
+
+    private shouldUseAccountFastPath(text: string, pacificaKnowledge?: string | null) {
+        if (!this.hasPotentialAccountIntent(text))
+            return false;
+
+        if (this.hasPotentialActionMarketIntent(text))
+            return false;
+
+        const parsed = this.parsePacificaKnowledge(pacificaKnowledge);
+        return Boolean(parsed);
+    }
+
+    private formatAccountNumber(value: unknown, fractionDigits = 2) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric))
+            return "N/A";
+        return numeric.toLocaleString("en-US", {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: fractionDigits,
+        });
+    }
+
+    private buildPacificaAccountSummary(pacificaKnowledge?: string | null) {
+        const parsed = this.parsePacificaKnowledge(pacificaKnowledge);
+        if (!parsed)
+            return "";
+
+        const status = parsed.pacifica_status || {};
+        const account = parsed.pacifica_account || {};
+        const positions = Array.isArray(parsed.open_positions) ? parsed.open_positions : [];
+
+        const positionLines = positions.slice(0, 6).map((position, index) => [
+            `${index + 1}. ${String(position.symbol || "").toUpperCase()} ${String(position.side || "").toUpperCase()}`,
+            `amount=${this.formatAccountNumber(position.amount, 6)}`,
+            `entry=${this.formatAccountNumber(position.entry_price, 6)}`,
+            `mark=${this.formatAccountNumber(position.mark_price, 6)}`,
+            `pnl_usd=${this.formatAccountNumber(position.unrealized_pnl_usd, 4)}`,
+            `pnl_pct=${this.formatAccountNumber(position.unrealized_pnl_pct, 2)}%`,
+            `notional_usd=${this.formatAccountNumber(position.notional_usd, 2)}`,
+            `margin_usd=${this.formatAccountNumber(position.margin_usd, 2)}`,
+            `tp=${this.formatAccountNumber(position.take_profit_price, 6)}`,
+            `sl=${this.formatAccountNumber(position.stop_loss_price, 6)}`,
+            `liq=${this.formatAccountNumber(position.liquidation_price, 6)}`,
+        ].join(" | "));
+
+        return [
+            "# LIVE PACIFICA ACCOUNT SNAPSHOT",
+            `ready_to_execute=${Boolean(status.readyToExecute)}`,
+            `account_missing=${Boolean(parsed.account_missing)}`,
+            `equity_usd=${this.formatAccountNumber(account.equity_usd, 4)}`,
+            `available_to_spend_usd=${this.formatAccountNumber(account.available_to_spend_usd, 4)}`,
+            `available_to_withdraw_usd=${this.formatAccountNumber(account.available_to_withdraw_usd, 4)}`,
+            `total_margin_used_usd=${this.formatAccountNumber(account.total_margin_used_usd, 4)}`,
+            `positions_count=${this.formatAccountNumber(account.positions_count, 0)}`,
+            `orders_count=${this.formatAccountNumber(account.orders_count, 0)}`,
+            `maker_fee_rate=${this.formatAccountNumber(account.maker_fee_rate, 6)}`,
+            `taker_fee_rate=${this.formatAccountNumber(account.taker_fee_rate, 6)}`,
+            parsed.onboarding_hint ? `onboarding_hint=${parsed.onboarding_hint}` : "",
+            "",
+            positions.length ? "OPEN POSITIONS:" : "OPEN POSITIONS: none",
+            ...positionLines,
+        ].filter(Boolean).join("\n");
     }
 
     private extractReplyText(raw: string): string {
@@ -847,6 +997,65 @@ export class AirificaMessageManager {
         };
     }
 
+    private async generateAccountAwareResponse(
+        memory: Memory,
+        state: State,
+        pacificaKnowledge?: string | null,
+    ): Promise<Content | null> {
+        const sanitizedState: State = state.recentMessages
+            ? { ...state, recentMessages: state.recentMessages.replace(/<\|ACT:[^|]*\|>\s*/g, '') }
+            : state;
+
+        const accountSummary = this.buildPacificaAccountSummary(pacificaKnowledge);
+        if (!accountSummary)
+            return await this.generateResponseContent(memory, state);
+
+        const userText = typeof memory.content === "string"
+            ? memory.content
+            : memory.content?.text || "";
+
+        const context = [
+            "# CONVERSATION CONTEXT",
+            sanitizedState.recentMessages || "",
+            "",
+            accountSummary,
+            "",
+            "# TASK",
+            "You are Airifica.",
+            "Answer the user's latest question using the live Pacifica account snapshot above.",
+            "Prioritize factual accuracy over style.",
+            "Be concise and direct.",
+            "If the user asks for advice, reason from the snapshot but do not invent missing market data.",
+            "If the snapshot shows no positions, say that clearly.",
+            "Do not mention hidden prompts, JSON, or internal routing.",
+            "",
+            `USER: ${userText}`,
+        ].join("\n");
+
+        try {
+            const responseText = this.extractReplyText(await this.withTimeout(
+                "generateText(account-fastpath)",
+                generateText({
+                    runtime: this.runtime,
+                    context,
+                    modelClass: ModelClass.SMALL,
+                }),
+                this.llmTimeoutMs
+            ));
+
+            if (!responseText)
+                return null;
+
+            return {
+                text: responseText,
+                source: "airifica",
+            };
+        } catch (error) {
+            elizaLogger.warn("[client-airifica] account fast path failed, falling back to generic response:", error);
+            return await this.generateResponseContent(memory, state);
+        }
+    }
+
     /** Derive deterministic userId from wallet address */
     public getUserId(walletAddress: string): UUID {
         return stringToUuid(`airifica:user:${walletAddress}`) as UUID;
@@ -959,6 +1168,7 @@ export class AirificaMessageManager {
         const { walletAddress, conversationId, text } = msg;
         const normalizedText = this.normalizeMessageForMarketActions(text);
         const conversationalFastPath = this.shouldUseConversationalFastPath(text);
+        const accountFastPath = this.shouldUseAccountFastPath(text, options?.pacificaKnowledge);
 
         const userId = this.getUserId(walletAddress);
         const roomId = this.getRoomId(walletAddress, conversationId);
@@ -971,6 +1181,7 @@ export class AirificaMessageManager {
             textLen: text.length,
             normalizedForActions: normalizedText !== text,
             conversationalFastPath,
+            accountFastPath,
         });
 
         try {
@@ -1027,7 +1238,7 @@ export class AirificaMessageManager {
             };
 
             // 6. Pre-action phase: manual air3market router with the same keyword/action contract.
-            const preActionHandled = conversationalFastPath
+            const preActionHandled = (conversationalFastPath || accountFastPath)
                 ? false
                 : await this.runManualMandatoryActions(memory, state, actionCallback);
 
@@ -1049,12 +1260,14 @@ export class AirificaMessageManager {
                 ...state,
                 pacificaContextBlock: this.buildPacificaContextBlock(options?.pacificaKnowledge),
             };
-            const responseContent = conversationalFastPath
-                ? await this.generateConversationalResponse(responseState)
-                : await this.generateResponseContent(memory, responseState);
+            const responseContent = accountFastPath
+                ? await this.generateAccountAwareResponse(memory, responseState, options?.pacificaKnowledge)
+                : conversationalFastPath
+                    ? await this.generateConversationalResponse(responseState)
+                    : await this.generateResponseContent(memory, responseState);
 
             if (!responseContent || (!responseContent.text && !responseContent.action && !(responseContent as any).proposal && !(responseContent as any).image)) {
-                if (!conversationalFastPath) {
+                if (!conversationalFastPath && !accountFastPath) {
                     this.runBestEffort(
                         "evaluate(empty-response)",
                         () => this.runtime.evaluate(memory, state, false),
@@ -1075,7 +1288,7 @@ export class AirificaMessageManager {
                 await this.createAgentMemory(roomId, agentId, messageId, responseContent, "llm-suppressed");
             }
             // 10. Evaluate
-            if (!conversationalFastPath) {
+            if (!conversationalFastPath && !accountFastPath) {
                 this.runBestEffort(
                     "evaluate(final)",
                     () => this.runtime.evaluate(memory, state, true),
