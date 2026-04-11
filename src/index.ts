@@ -3,14 +3,14 @@ import {
     Airi3ClientInterface,
     Airi3MessageManager,
     Airi3Server,
-} from "@elizaos/client-airi3";
+} from "../../client-airi3/src/index.ts";
 
 export {
     Airi3Client,
     Airi3ClientInterface,
     Airi3MessageManager,
     Airi3Server,
-} from "@elizaos/client-airi3";
+} from "../../client-airi3/src/index.ts";
 
 export const AirificaClient = Airi3Client;
 export const AirificaMessageManager = Airi3MessageManager;
