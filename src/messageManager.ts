@@ -146,6 +146,9 @@ const MARKET_SYMBOL_STOPWORDS = new Set([
     "ANALYSIS", "ANALYZE", "ANALYSE", "MENTIONED", "TOP", "MOST",
 ]);
 
+const MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|wallet|position|positions|portfolio|pnl|fundamental|fundamentals|tokenomics|pacifica|jupiter|perp|spot)\b/i;
+const CONVERSATIONAL_FAST_PATH_PATTERN = /\b(hi|hello|hey|yo|gm|gn|good morning|good evening|good night|how are you|how's it going|how is it going|what's up|whats up|who are you|thanks|thank you|ok|okay|cool|nice|great|perfect|understood|got it|help me|help)\b/i;
+
 const TOKEN_ALIAS_OVERRIDES: Record<string, string> = {
     AIR3: "2jvsWRkT17ofmv9pkW7ofqAFWSCNyJYdykJ7kPKbmoon",
     LAIR: "0xbC62C287b50B86A46e5B552bCd5BF9b64DA35eCc",
@@ -429,6 +432,41 @@ export class AirificaMessageManager {
         });
     }
 
+    private hasPotentialMarketIntent(text: string) {
+        const raw = String(text || "").trim();
+        if (!raw)
+            return false;
+
+        if (MARKET_INTENT_PATTERN.test(raw))
+            return true;
+
+        if (this.extractOverrideAddresses(raw).length > 0)
+            return true;
+
+        if (this.extractUniqueMatches(raw, EVM_ADDRESS_PATTERN).length > 0)
+            return true;
+
+        if (this.extractUniqueMatches(raw, BASE58_ADDRESS_PATTERN).length > 0)
+            return true;
+
+        if (this.extractExplicitTickers(raw).length > 0)
+            return true;
+
+        const plainSymbols: string[] = raw.match(/\b[A-Za-z]{2,10}\b/g) || [];
+        return plainSymbols.some((symbol) => MARKET_SYMBOL_ALIASES.has(symbol.toLowerCase()));
+    }
+
+    private shouldUseConversationalFastPath(text: string) {
+        const raw = String(text || "").trim();
+        if (!raw)
+            return false;
+
+        if (this.hasPotentialMarketIntent(raw))
+            return false;
+
+        return CONVERSATIONAL_FAST_PATH_PATTERN.test(raw) || raw.split(/\s+/).length <= 8;
+    }
+
     private extractReplyText(raw: string): string {
         const trimmed = raw.trim();
         if (!trimmed)
@@ -657,6 +695,9 @@ export class AirificaMessageManager {
         if (!originalText.trim())
             return false;
 
+        if (!this.hasPotentialMarketIntent(originalText))
+            return false;
+
         let routePlan: RoutedActionPlan = {
             keyword: null,
             routedText: originalText,
@@ -742,6 +783,68 @@ export class AirificaMessageManager {
         }
 
         return false;
+    }
+
+    private async generateConversationalResponse(state: State): Promise<Content | null> {
+        const sanitizedState: State = state.recentMessages
+            ? { ...state, recentMessages: state.recentMessages.replace(/<\|ACT:[^|]*\|>\s*/g, '') }
+            : state;
+
+        const baseTemplate = this.runtime.character.templates?.messageHandlerTemplate || AIRIFICA_DEFAULT_TEMPLATE;
+        const responseTemplate = typeof baseTemplate === 'string'
+            ? (baseTemplate.includes('{{pacificaContextBlock}}')
+                ? baseTemplate
+                : `${baseTemplate}\n\n{{pacificaContextBlock}}`)
+            : ({ state }: { state: State }) => {
+                const resolved = baseTemplate({ state });
+                return resolved.includes('{{pacificaContextBlock}}')
+                    ? resolved
+                    : `${resolved}\n\n{{pacificaContextBlock}}`;
+            };
+
+        const responseContext = composeContext({
+            state: sanitizedState,
+            template: responseTemplate,
+        });
+
+        try {
+            const responseText = this.extractReplyText(await this.withTimeout(
+                "generateText(conversation-fastpath)",
+                generateText({
+                    runtime: this.runtime,
+                    context: responseContext,
+                    modelClass: ModelClass.SMALL,
+                }),
+                this.llmTimeoutMs
+            ));
+
+            if (responseText) {
+                return {
+                    text: responseText,
+                    source: "airifica",
+                };
+            }
+        } catch (error) {
+            elizaLogger.warn("[client-airifica] conversation fast path small-model failed:", error);
+        }
+
+        const responseText = this.extractReplyText(await this.withTimeout(
+            "generateText(conversation-fastpath-large)",
+            generateText({
+                runtime: this.runtime,
+                context: responseContext,
+                modelClass: ModelClass.LARGE,
+            }),
+            this.llmTimeoutMs
+        ));
+
+        if (!responseText)
+            return null;
+
+        return {
+            text: responseText,
+            source: "airifica",
+        };
     }
 
     /** Derive deterministic userId from wallet address */
@@ -855,6 +958,7 @@ export class AirificaMessageManager {
     ): Promise<AirificaMessageEnvelope[]> {
         const { walletAddress, conversationId, text } = msg;
         const normalizedText = this.normalizeMessageForMarketActions(text);
+        const conversationalFastPath = this.shouldUseConversationalFastPath(text);
 
         const userId = this.getUserId(walletAddress);
         const roomId = this.getRoomId(walletAddress, conversationId);
@@ -866,6 +970,7 @@ export class AirificaMessageManager {
             conversationId,
             textLen: text.length,
             normalizedForActions: normalizedText !== text,
+            conversationalFastPath,
         });
 
         try {
@@ -922,31 +1027,40 @@ export class AirificaMessageManager {
             };
 
             // 6. Pre-action phase: manual air3market router with the same keyword/action contract.
-            const preActionHandled = await this.runManualMandatoryActions(memory, state, actionCallback);
+            const preActionHandled = conversationalFastPath
+                ? false
+                : await this.runManualMandatoryActions(memory, state, actionCallback);
 
             // 7. If an action already replied, stop here
             if (actionSent || preActionHandled) {
-                this.runBestEffort(
-                    "evaluate(action)",
-                    () => this.runtime.evaluate(memory, state, true),
-                    this.evaluationTimeoutMs
-                );
+                if (!conversationalFastPath) {
+                    this.runBestEffort(
+                        "evaluate(action)",
+                        () => this.runtime.evaluate(memory, state, true),
+                        this.evaluationTimeoutMs
+                    );
+                }
                 return responses;
             }
 
             // 8. Fallback LLM: no action handled the message.
             // Use structured generation first so post-actions keep parity with Telegram.
-            const responseContent = await this.generateResponseContent(memory, {
+            const responseState = {
                 ...state,
                 pacificaContextBlock: this.buildPacificaContextBlock(options?.pacificaKnowledge),
-            });
+            };
+            const responseContent = conversationalFastPath
+                ? await this.generateConversationalResponse(responseState)
+                : await this.generateResponseContent(memory, responseState);
 
             if (!responseContent || (!responseContent.text && !responseContent.action && !(responseContent as any).proposal && !(responseContent as any).image)) {
-                this.runBestEffort(
-                    "evaluate(empty-response)",
-                    () => this.runtime.evaluate(memory, state, false),
-                    this.evaluationTimeoutMs
-                );
+                if (!conversationalFastPath) {
+                    this.runBestEffort(
+                        "evaluate(empty-response)",
+                        () => this.runtime.evaluate(memory, state, false),
+                        this.evaluationTimeoutMs
+                    );
+                }
                 return responses;
             }
 
@@ -961,11 +1075,13 @@ export class AirificaMessageManager {
                 await this.createAgentMemory(roomId, agentId, messageId, responseContent, "llm-suppressed");
             }
             // 10. Evaluate
-            this.runBestEffort(
-                "evaluate(final)",
-                () => this.runtime.evaluate(memory, state, true),
-                this.evaluationTimeoutMs
-            );
+            if (!conversationalFastPath) {
+                this.runBestEffort(
+                    "evaluate(final)",
+                    () => this.runtime.evaluate(memory, state, true),
+                    this.evaluationTimeoutMs
+                );
+            }
 
             return responses;
         } catch (error: any) {
