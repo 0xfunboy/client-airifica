@@ -875,15 +875,29 @@ export class AirificaMessageManager {
         };
 
         try {
-            routePlan = this.buildDeterministicActionRoute(originalText, this.normalizeMessageForMarketActions(originalText))
-                || await this.routeMessageForActions(originalText);
-            elizaLogger.info("[client-airifica] action-router", {
+            const deterministic = this.buildDeterministicActionRoute(
                 originalText,
-                routedText: routePlan.routedText,
-                keyword: routePlan.keyword,
-                source: routePlan.source,
-                raw: routePlan.raw,
-            });
+                this.normalizeMessageForMarketActions(originalText),
+            );
+            if (deterministic) {
+                routePlan = deterministic;
+                elizaLogger.info("[client-airifica] action-router", {
+                    originalText,
+                    routedText: routePlan.routedText,
+                    keyword: routePlan.keyword,
+                    source: routePlan.source,
+                    raw: routePlan.raw,
+                });
+            } else {
+                routePlan = await this.routeMessageForActions(originalText);
+                elizaLogger.info("[client-airifica] action-router", {
+                    originalText,
+                    routedText: routePlan.routedText,
+                    keyword: routePlan.keyword,
+                    source: routePlan.source,
+                    raw: routePlan.raw,
+                });
+            }
         } catch (error) {
             elizaLogger.warn("[client-airifica] action-router fallback to original text:", error);
         }
@@ -911,6 +925,7 @@ export class AirificaMessageManager {
             !!action && typeof action.name === "string"
         && candidateActions.has(action.name)
         );
+        const singleCandidate = routePlan.candidateActions.length === 1;
 
         for (const action of pluginActions) {
             try {
@@ -919,8 +934,11 @@ export class AirificaMessageManager {
                     Promise.resolve(action.validate(this.runtime, routedMemory, state)),
                     this.actionValidationTimeoutMs
                 );
-                if (isValid)
+                if (isValid) {
                     validatedActions.set(action.name, action);
+                    if (singleCandidate)
+                        break;
+                }
             } catch (error) {
                 const details = error instanceof Error
                     ? `${error.message}\n${error.stack ?? ""}`.trim()
