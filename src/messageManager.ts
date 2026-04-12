@@ -837,16 +837,34 @@ export class AirificaMessageManager {
         memory: Memory,
         state: State,
         actionCallback: HandlerCallback
-    ): Promise<boolean> {
+    ): Promise<{ handled: boolean; routePlan: RoutedActionPlan }> {
         const originalText = typeof memory.content === "string"
             ? memory.content
             : memory.content?.text || "";
 
         if (!originalText.trim())
-            return false;
+            return {
+                handled: false,
+                routePlan: {
+                    keyword: null,
+                    routedText: originalText,
+                    raw: originalText,
+                    source: "deterministic",
+                    candidateActions: [],
+                },
+            };
 
         if (!this.hasPotentialMarketIntent(originalText))
-            return false;
+            return {
+                handled: false,
+                routePlan: {
+                    keyword: null,
+                    routedText: originalText,
+                    raw: originalText,
+                    source: "deterministic",
+                    candidateActions: [],
+                },
+            };
 
         let routePlan: RoutedActionPlan = {
             keyword: null,
@@ -871,7 +889,7 @@ export class AirificaMessageManager {
         }
 
         if (!routePlan.keyword || routePlan.candidateActions.length === 0)
-            return false;
+            return { handled: false, routePlan };
 
         const routedMemory: Memory = {
             ...memory,
@@ -923,7 +941,7 @@ export class AirificaMessageManager {
                     this.getActionHandlerTimeoutMs(action.name)
                 );
                 if (handled)
-                    return true;
+                    return { handled: true, routePlan };
             } catch (error) {
                 const details = error instanceof Error
                     ? `${error.message}\n${error.stack ?? ""}`.trim()
@@ -932,7 +950,7 @@ export class AirificaMessageManager {
             }
         }
 
-        return false;
+        return { handled: false, routePlan };
     }
 
     private async generateConversationalResponse(state: State): Promise<Content | null> {
@@ -1157,6 +1175,47 @@ export class AirificaMessageManager {
         };
     }
 
+    private async generateMarketChatResponse(state: State): Promise<Content | null> {
+        const sanitizedState: State = state.recentMessages
+            ? { ...state, recentMessages: state.recentMessages.replace(/<\|ACT:[^|]*\|>\s*/g, '') }
+            : state;
+
+        const baseTemplate = this.runtime.character.templates?.messageHandlerTemplate || AIRIFICA_DEFAULT_TEMPLATE;
+        const responseTemplate = typeof baseTemplate === 'string'
+            ? (baseTemplate.includes('{{pacificaContextBlock}}')
+                ? baseTemplate
+                : `${baseTemplate}\n\n{{pacificaContextBlock}}`)
+            : ({ state }: { state: State }) => {
+                const resolved = baseTemplate({ state });
+                return resolved.includes('{{pacificaContextBlock}}')
+                    ? resolved
+                    : `${resolved}\n\n{{pacificaContextBlock}}`;
+            };
+
+        const responseContext = composeContext({
+            state: sanitizedState,
+            template: responseTemplate,
+        });
+
+        const responseText = this.extractReplyText(await this.withTimeout(
+            "generateText(market-fastpath)",
+            generateText({
+                runtime: this.runtime,
+                context: responseContext,
+                modelClass: ModelClass.SMALL,
+            }),
+            this.llmTimeoutMs
+        ));
+
+        if (!responseText)
+            return null;
+
+        return {
+            text: responseText,
+            source: "airifica",
+        };
+    }
+
     /**
      * Process an incoming message from the Airifica web client.
      * Returns an array of response envelopes (may be multiple if chunked).
@@ -1169,6 +1228,7 @@ export class AirificaMessageManager {
         const normalizedText = this.normalizeMessageForMarketActions(text);
         const conversationalFastPath = this.shouldUseConversationalFastPath(text);
         const accountFastPath = this.shouldUseAccountFastPath(text, options?.pacificaKnowledge);
+        let marketFastPath = false;
 
         const userId = this.getUserId(walletAddress);
         const roomId = this.getRoomId(walletAddress, conversationId);
@@ -1238,9 +1298,21 @@ export class AirificaMessageManager {
             };
 
             // 6. Pre-action phase: manual air3market router with the same keyword/action contract.
-            const preActionHandled = (conversationalFastPath || accountFastPath)
-                ? false
+            const actionRoutingResult = (conversationalFastPath || accountFastPath)
+                ? { handled: false, routePlan: {
+                    keyword: null,
+                    routedText: normalizedText,
+                    raw: normalizedText,
+                    source: "deterministic",
+                    candidateActions: [],
+                } }
                 : await this.runManualMandatoryActions(memory, state, actionCallback);
+            const preActionHandled = actionRoutingResult.handled;
+            marketFastPath = !conversationalFastPath
+                && !accountFastPath
+                && !preActionHandled
+                && actionRoutingResult.routePlan.keyword == null
+                && this.hasPotentialActionMarketIntent(text);
 
             // 7. If an action already replied, stop here
             if (actionSent || preActionHandled) {
@@ -1264,10 +1336,12 @@ export class AirificaMessageManager {
                 ? await this.generateAccountAwareResponse(memory, responseState, options?.pacificaKnowledge)
                 : conversationalFastPath
                     ? await this.generateConversationalResponse(responseState)
-                    : await this.generateResponseContent(memory, responseState);
+                    : marketFastPath
+                        ? await this.generateMarketChatResponse(responseState)
+                        : await this.generateResponseContent(memory, responseState);
 
             if (!responseContent || (!responseContent.text && !responseContent.action && !(responseContent as any).proposal && !(responseContent as any).image)) {
-                if (!conversationalFastPath && !accountFastPath) {
+                if (!conversationalFastPath && !accountFastPath && !marketFastPath) {
                     this.runBestEffort(
                         "evaluate(empty-response)",
                         () => this.runtime.evaluate(memory, state, false),
@@ -1288,7 +1362,7 @@ export class AirificaMessageManager {
                 await this.createAgentMemory(roomId, agentId, messageId, responseContent, "llm-suppressed");
             }
             // 10. Evaluate
-            if (!conversationalFastPath && !accountFastPath) {
+            if (!conversationalFastPath && !accountFastPath && !marketFastPath) {
                 this.runBestEffort(
                     "evaluate(final)",
                     () => this.runtime.evaluate(memory, state, true),
