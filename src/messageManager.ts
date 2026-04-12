@@ -148,6 +148,7 @@ const MARKET_SYMBOL_STOPWORDS = new Set([
 
 const MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|wallet|position|positions|portfolio|pnl|fundamental|fundamentals|tokenomics|pacifica|jupiter|perp|spot)\b/i;
 const ACTION_MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|fundamental|fundamentals|tokenomics|jupiter|perp|spot)\b/i;
+const ACTION_ROUTER_HIGH_SIGNAL_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|fundamental|fundamentals|tokenomics)\b/i;
 const ACCOUNT_INTENT_PATTERN = /\b(open position|open positions|position|positions|portfolio|account|equity|available|withdrawable|margin|pnl|profit|loss|liquidation|liq|exposure|ready to trade|risk|overexposed|close now|hold now|reduce risk|execution state)\b/i;
 const CONVERSATIONAL_FAST_PATH_PATTERN = /\b(hi|hello|hey|yo|gm|gn|good morning|good evening|good night|how are you|how's it going|how is it going|what's up|whats up|who are you|thanks|thank you|ok|okay|cool|nice|great|perfect|understood|got it|help me|help)\b/i;
 
@@ -184,7 +185,7 @@ type RoutedActionPlan = {
     keyword: string | null;
     routedText: string;
     raw: string;
-    source: "deterministic" | "llm";
+    source: "deterministic" | "llm-small" | "llm-large";
     candidateActions: string[];
 };
 
@@ -797,40 +798,62 @@ export class AirificaMessageManager {
     }
 
     private async routeMessageForActions(originalText: string): Promise<RoutedActionPlan> {
-        const formatted = (await this.withTimeout(
-            "generateText(action-router)",
-            generateText({
-                runtime: this.runtime,
-                context: buildActionRoutingPrompt(originalText),
-                modelClass: ModelClass.LARGE,
-            }),
-            this.llmTimeoutMs
-        )).replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+        const parseRouterOutput = (formatted: string, source: RoutedActionPlan["source"]): RoutedActionPlan => {
+            const outMatch = formatted.match(/<out>([\s\S]*?)<\/out>/i);
+            const routedPayload = outMatch?.[1]?.trim() || formatted;
+            const hiddenMatch = routedPayload.match(/<hidden>([\s\S]*?)<\/hidden>/i);
+            const hidden = hiddenMatch?.[1]?.trim() || "";
+            const visibleText = routedPayload
+                .replace(/<hidden>[\s\S]*?<\/hidden>/gi, "")
+                .replace(/^"+|"+$/g, "")
+                .trim();
+            const firstDirective = hidden
+                .split(/[;,]/)
+                .map((part) => part.trim())
+                .find(Boolean) || "";
+            const keyword = firstDirective.toLowerCase() === "no action tools" ? null : firstDirective;
+            const routedText = keyword
+                ? `${keyword} ${visibleText || originalText}`.trim()
+                : (visibleText || originalText).trim();
 
-        const outMatch = formatted.match(/<out>([\s\S]*?)<\/out>/i);
-        const routedPayload = outMatch?.[1]?.trim() || formatted;
-        const hiddenMatch = routedPayload.match(/<hidden>([\s\S]*?)<\/hidden>/i);
-        const hidden = hiddenMatch?.[1]?.trim() || "";
-        const visibleText = routedPayload
-            .replace(/<hidden>[\s\S]*?<\/hidden>/gi, "")
-            .replace(/^"+|"+$/g, "")
-            .trim();
-        const firstDirective = hidden
-            .split(/[;,]/)
-            .map(part => part.trim())
-            .find(Boolean) || "";
-        const keyword = firstDirective.toLowerCase() === "no action tools" ? null : firstDirective;
-        const routedText = keyword
-            ? `${keyword} ${visibleText || originalText}`.trim()
-            : (visibleText || originalText).trim();
-
-        return {
-            keyword,
-            routedText,
-            raw: formatted,
-            source: "llm",
-            candidateActions: this.resolveRouteCandidateActions(keyword),
+            return {
+                keyword,
+                routedText,
+                raw: formatted,
+                source,
+                candidateActions: this.resolveRouteCandidateActions(keyword),
+            };
         };
+
+        const runRouter = async (modelClass: ModelClass, source: RoutedActionPlan["source"]) => {
+            const formatted = (await this.withTimeout(
+                `generateText(action-router:${source})`,
+                generateText({
+                    runtime: this.runtime,
+                    context: buildActionRoutingPrompt(originalText),
+                    modelClass,
+                }),
+                this.llmTimeoutMs
+            )).replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+
+            return parseRouterOutput(formatted, source);
+        };
+
+        const smallPlan = await runRouter(ModelClass.SMALL, "llm-small");
+        const shouldRetryWithLarge = !smallPlan.keyword
+            && ACTION_ROUTER_HIGH_SIGNAL_PATTERN.test(originalText)
+            && !this.buildDeterministicActionRoute(originalText, this.normalizeMessageForMarketActions(originalText));
+
+        if (!shouldRetryWithLarge)
+            return smallPlan;
+
+        elizaLogger.info("[client-airifica] action-router escalate", {
+            originalText,
+            smallKeyword: smallPlan.keyword,
+            smallSource: smallPlan.source,
+        });
+
+        return await runRouter(ModelClass.LARGE, "llm-large");
     }
 
     private async runManualMandatoryActions(
@@ -870,7 +893,7 @@ export class AirificaMessageManager {
             keyword: null,
             routedText: originalText,
             raw: originalText,
-            source: "llm",
+            source: "llm-small",
             candidateActions: [],
         };
 
@@ -1234,6 +1257,54 @@ export class AirificaMessageManager {
         };
     }
 
+    private async generateActionMissResponse(
+        memory: Memory,
+        state: State,
+        routePlan: RoutedActionPlan,
+    ): Promise<Content | null> {
+        const userText = typeof memory.content === "string"
+            ? memory.content
+            : memory.content?.text || "";
+        const sanitizedState: State = state.recentMessages
+            ? { ...state, recentMessages: state.recentMessages.replace(/<\|ACT:[^|]*\|>\s*/g, '') }
+            : state;
+
+        const context = [
+            "# CONVERSATION CONTEXT",
+            sanitizedState.recentMessages || "",
+            "",
+            state.pacificaContextBlock || "",
+            "",
+            "# TASK",
+            "You are Airifica.",
+            "The user asked a market-related question, but no executable action completed.",
+            "Answer directly in plain text using the available context.",
+            "If the request lacks a resolvable market entity or actionable data, state what is missing in one short sentence.",
+            "Do not mention hidden routing, validators, or internal tools.",
+            "",
+            `ROUTER_KEYWORD: ${routePlan.keyword || "none"}`,
+            `USER: ${userText}`,
+        ].join("\n");
+
+        const responseText = this.extractReplyText(await this.withTimeout(
+            "generateText(action-miss-fastpath)",
+            generateText({
+                runtime: this.runtime,
+                context,
+                modelClass: ModelClass.SMALL,
+            }),
+            this.llmTimeoutMs
+        ));
+
+        if (!responseText)
+            return null;
+
+        return {
+            text: responseText,
+            source: "airifica",
+        };
+    }
+
     /**
      * Process an incoming message from the Airifica web client.
      * Returns an array of response envelopes (may be multiple if chunked).
@@ -1247,6 +1318,7 @@ export class AirificaMessageManager {
         const conversationalFastPath = this.shouldUseConversationalFastPath(text);
         const accountFastPath = this.shouldUseAccountFastPath(text, options?.pacificaKnowledge);
         let marketFastPath = false;
+        let actionMissFastPath = false;
 
         const userId = this.getUserId(walletAddress);
         const roomId = this.getRoomId(walletAddress, conversationId);
@@ -1316,7 +1388,7 @@ export class AirificaMessageManager {
             };
 
             // 6. Pre-action phase: manual air3market router with the same keyword/action contract.
-            const actionRoutingResult = (conversationalFastPath || accountFastPath)
+            const actionRoutingResult: { handled: boolean; routePlan: RoutedActionPlan } = (conversationalFastPath || accountFastPath)
                 ? { handled: false, routePlan: {
                     keyword: null,
                     routedText: normalizedText,
@@ -1331,6 +1403,10 @@ export class AirificaMessageManager {
                 && !preActionHandled
                 && actionRoutingResult.routePlan.keyword == null
                 && this.hasPotentialActionMarketIntent(text);
+            actionMissFastPath = !conversationalFastPath
+                && !accountFastPath
+                && !preActionHandled
+                && actionRoutingResult.routePlan.keyword != null;
 
             // 7. If an action already replied, stop here
             if (actionSent || preActionHandled) {
@@ -1356,10 +1432,12 @@ export class AirificaMessageManager {
                     ? await this.generateConversationalResponse(responseState)
                     : marketFastPath
                         ? await this.generateMarketChatResponse(responseState)
+                        : actionMissFastPath
+                            ? await this.generateActionMissResponse(memory, responseState, actionRoutingResult.routePlan)
                         : await this.generateResponseContent(memory, responseState);
 
             if (!responseContent || (!responseContent.text && !responseContent.action && !(responseContent as any).proposal && !(responseContent as any).image)) {
-                if (!conversationalFastPath && !accountFastPath && !marketFastPath) {
+                if (!conversationalFastPath && !accountFastPath && !marketFastPath && !actionMissFastPath) {
                     this.runBestEffort(
                         "evaluate(empty-response)",
                         () => this.runtime.evaluate(memory, state, false),
@@ -1380,7 +1458,7 @@ export class AirificaMessageManager {
                 await this.createAgentMemory(roomId, agentId, messageId, responseContent, "llm-suppressed");
             }
             // 10. Evaluate
-            if (!conversationalFastPath && !accountFastPath && !marketFastPath) {
+            if (!conversationalFastPath && !accountFastPath && !marketFastPath && !actionMissFastPath) {
                 this.runBestEffort(
                     "evaluate(final)",
                     () => this.runtime.evaluate(memory, state, true),
