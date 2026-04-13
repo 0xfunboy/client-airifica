@@ -1374,7 +1374,9 @@ export class AirificaMessageManager {
             // 5. Action callback — called by processActions when an action fires
             const actionCallback: HandlerCallback = async (actionContent: Content) => {
                 actionSent = true;
-                const envelope = this.contentToEnvelope(conversationId, actionContent);
+                const envelope = await this.contentToEnvelope(conversationId, actionContent, {
+                    includeDerivedProposal: true,
+                });
                 responses.push(envelope);
 
                 const agentMemory = await this.createAgentMemory(
