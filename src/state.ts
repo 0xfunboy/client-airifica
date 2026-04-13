@@ -216,6 +216,12 @@ export class AirificaStateStore {
         return next;
     }
 
+    getLatestExecutedProposalForWallet(walletAddress: string) {
+        return Object.values(this.state.proposals)
+            .filter(proposal => proposal.walletAddress === walletAddress && proposal.status === "EXECUTED")
+            .sort((left, right) => right.updatedAt - left.updatedAt)[0] || null;
+    }
+
     pruneExpiredTelegramLinkCodes(now = Date.now()) {
         let dirty = false;
         for (const [code, record] of Object.entries(this.state.telegramLinkCodes)) {

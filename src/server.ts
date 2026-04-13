@@ -204,6 +204,13 @@ function normalizeOrderSymbol(order: any) {
     return normalizeSymbol(order?.symbol ?? order?.market ?? order?.ticker);
 }
 
+function formatUsdCompact(value: number) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric))
+        return "0.00";
+    return numeric.toFixed(Math.abs(numeric) >= 100 ? 2 : 4);
+}
+
 function pickBracketPrice(
     side: "LONG" | "SHORT" | null,
     entryPrice: number,
@@ -983,6 +990,32 @@ export class AirificaServer {
             }
         };
 
+        const buildTelegramWalletSummary = async (walletAddress: string) => {
+            const overview = await buildPacificaOverview(walletAddress);
+            await maybePrimePacificaKnowledge(walletAddress, overview);
+            const account = overview.account;
+            const positions = Array.isArray(overview.positions) ? overview.positions : [];
+            const totalPnlUsd = positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0);
+            const latestTrade = this.stateStore.getLatestExecutedProposalForWallet(walletAddress);
+
+            return {
+                walletAddress,
+                equityUsd: account ? Number(account.equity || 0) : 0,
+                availableUsd: account ? Number(account.availableToSpend || 0) : 0,
+                withdrawableUsd: account ? Number(account.availableToWithdraw || 0) : 0,
+                positionsCount: positions.length,
+                totalPnlUsd,
+                latestTrade: latestTrade
+                    ? {
+                        symbol: latestTrade.proposal.symbol,
+                        side: latestTrade.proposal.side,
+                        orderId: latestTrade.orderId,
+                        updatedAt: latestTrade.updatedAt,
+                    }
+                    : null,
+            };
+        };
+
         /** POST /api/airi3/session */
         this.app.post("/api/airi3/session", async (req: Request, res: Response) => {
             try {
@@ -1308,7 +1341,8 @@ export class AirificaServer {
                     return;
                 }
                 const link = this.stateStore.getTelegramLink(chatId);
-                res.json({ ok: true, link });
+                const summary = link ? await buildTelegramWalletSummary(link.walletAddress) : null;
+                res.json({ ok: true, link, summary });
             } catch (err: any) {
                 elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/link/status error:", err);
                 res.status(500).json({ ok: false, error: err?.message || "server error" });
