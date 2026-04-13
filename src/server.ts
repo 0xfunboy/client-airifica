@@ -1878,12 +1878,15 @@ export class AirificaServer {
 
                 const summary = await buildTelegramWalletSummary(link.walletAddress);
                 const pct = Math.min(100, Math.max(1, Number(req.body?.collateral_pct || 10)));
+                const requestedCollateralUsd = Number(req.body?.collateral_usd);
                 const leverage = Math.min(
                     Math.max(1, Number(proposal.maxLeverage || 1)),
                     Math.max(1, Number(req.body?.leverage || 1)),
                 );
                 const availableUsd = Number(summary.availableUsd || 0);
-                const marginUsd = Math.min(availableUsd, availableUsd * (pct / 100));
+                const marginUsd = Number.isFinite(requestedCollateralUsd) && requestedCollateralUsd > 0
+                    ? Math.min(availableUsd, requestedCollateralUsd)
+                    : Math.min(availableUsd, availableUsd * (pct / 100));
                 if (!Number.isFinite(marginUsd) || marginUsd <= 0) {
                     res.status(400).json({ ok: false, error: "No available collateral to execute this trade" });
                     return;
