@@ -4,6 +4,7 @@ function envValue(name: string, fallback = '') {
 
 const PACIFICA_PUBLIC_API_BASE = (envValue('PACIFICA_PUBLIC_API_BASE', process.env.PACIFICA_PUBLIC_API_BASE || 'https://api.pacifica.fi/api/v1')).replace(/\/$/, '');
 const PACIFICA_SYMBOLS_TTL_MS = Number(process.env.PACIFICA_SYMBOLS_TTL_MS || 6 * 60 * 60_000);
+const PACIFICA_UNIVERSE_SNAPSHOT_TTL_MS = Math.min(PACIFICA_SYMBOLS_TTL_MS, 10_000);
 const SUPPORTED_INTERVALS = new Set(['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '8h', '12h', '1d']);
 const DEXSCREENER_API_BASE = 'https://api.dexscreener.com';
 const GECKOTERMINAL_API_BASE = 'https://api.geckoterminal.com/api/v2';
@@ -14,7 +15,9 @@ const EVM_ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
 let pacificaSymbolsCache: { ts: number; symbols: Set<string> } | null = null;
 let pacificaPricesCache: { ts: number; prices: Record<string, any> } | null = null;
 let pacificaContractsCache: { ts: number; contracts: Record<string, any> } | null = null;
+let pacificaUniverseSnapshotCache: { ts: number; snapshot: PacificaMarketUniverseSnapshot } | null = null;
 const externalMarketCache = new Map<string, { ts: number; payload: MarketContextPayload }>();
+const externalResolutionCache = new Map<string, { ts: number; resolution: ExternalMarketResolution }>();
 
 const NUMERIC_CHAIN_TO_NETWORK: Record<number, string> = {
     1: 'ethereum',
@@ -103,6 +106,13 @@ export interface PacificaMarketUniverseRow {
     maxLeverage?: number | null;
 }
 
+interface PacificaMarketUniverseSnapshot {
+    rows: PacificaMarketUniverseRow[];
+    byTicker: Map<string, PacificaMarketUniverseRow>;
+    symbols: Set<string>;
+    refreshedAt: number;
+}
+
 interface DexScreenerPair {
     chainId?: string;
     dexId?: string;
@@ -120,6 +130,22 @@ interface DexScreenerPair {
         symbol?: string;
         address?: string;
     };
+}
+
+interface ExternalMarketResolution {
+    query: string;
+    symbol: string;
+    chainId: string | null;
+    pairAddress: string | null;
+    baseTokenAddress: string | null;
+    baseTokenName: string | null;
+    quoteSymbol: string;
+    currentPrice: number;
+    priceChange24h: number;
+    volume24h: number;
+    liquidityUsd: number;
+    provider: 'geckoterminal' | 'dexscreener';
+    supportedOnJupiter: boolean;
 }
 
 function tfToMs(tf: string) {
@@ -150,6 +176,10 @@ function normalizeAddress(raw: unknown) {
         return value;
 
     return null;
+}
+
+function normalizeResolutionCacheKey(raw: unknown) {
+    return String(raw || '').trim().toLowerCase();
 }
 
 export function normalizeMarketContextSymbol(raw: unknown) {
@@ -245,13 +275,8 @@ async function fetchGeckoJson<T>(path: string, search?: Record<string, string>) 
 }
 
 export async function getPacificaSymbolsSet() {
-    if (pacificaSymbolsCache && Date.now() - pacificaSymbolsCache.ts < PACIFICA_SYMBOLS_TTL_MS)
-        return pacificaSymbolsCache.symbols;
-
-    const contracts = await fetchPacificaContractsMap();
-    const symbols = new Set(Object.keys(contracts));
-    pacificaSymbolsCache = { ts: Date.now(), symbols };
-    return symbols;
+    const snapshot = await getPacificaMarketUniverseSnapshot();
+    return snapshot.symbols;
 }
 
 export async function isPacificaSupportedSymbol(symbol: string) {
@@ -289,13 +314,16 @@ async function fetchPacificaContractsMap() {
     return contracts;
 }
 
-export async function fetchPacificaMarketUniverse() {
+async function getPacificaMarketUniverseSnapshot() {
+    if (pacificaUniverseSnapshotCache && Date.now() - pacificaUniverseSnapshotCache.ts < PACIFICA_UNIVERSE_SNAPSHOT_TTL_MS)
+        return pacificaUniverseSnapshotCache.snapshot;
+
     const [priceMap, contractMap] = await Promise.all([
         fetchPacificaPriceMap(),
         fetchPacificaContractsMap(),
     ]);
 
-    return Object.keys(contractMap)
+    const rows = Object.keys(contractMap)
         .map((symbol) => {
             const contractRow = contractMap[symbol] || {};
             const priceRow = priceMap[symbol] || {};
@@ -320,13 +348,40 @@ export async function fetchPacificaMarketUniverse() {
             } satisfies PacificaMarketUniverseRow;
         })
         .sort((left, right) => right.volume24h - left.volume24h);
+
+    const byTicker = new Map<string, PacificaMarketUniverseRow>();
+    const symbols = new Set<string>();
+    for (const row of rows) {
+        byTicker.set(row.symbol, row);
+        symbols.add(row.symbol);
+    }
+
+    const snapshot: PacificaMarketUniverseSnapshot = {
+        rows,
+        byTicker,
+        symbols,
+        refreshedAt: Date.now(),
+    };
+
+    pacificaUniverseSnapshotCache = {
+        ts: snapshot.refreshedAt,
+        snapshot,
+    };
+    pacificaSymbolsCache = {
+        ts: snapshot.refreshedAt,
+        symbols,
+    };
+
+    return snapshot;
+}
+
+export async function fetchPacificaMarketUniverse() {
+    const snapshot = await getPacificaMarketUniverseSnapshot();
+    return snapshot.rows;
 }
 
 export async function primePacificaMarketUniverse() {
-    await Promise.all([
-        fetchPacificaContractsMap(),
-        fetchPacificaPriceMap(),
-    ]);
+    await getPacificaMarketUniverseSnapshot();
 }
 
 async function fetchPacificaKlines(symbol: string, interval: string, startTime: number, endTime: number) {
@@ -359,6 +414,39 @@ function resolveDexEndpoint(query: string) {
         return `${DEXSCREENER_API_BASE}/latest/dex/tokens/${query}`;
 
     return `${DEXSCREENER_API_BASE}/latest/dex/search?q=${encodeURIComponent(query)}`;
+}
+
+function getCachedExternalResolution(query: string) {
+    const cacheKey = normalizeResolutionCacheKey(query);
+    const cached = externalResolutionCache.get(cacheKey);
+    if (!cached)
+        return null;
+    if (Date.now() - cached.ts >= EXTERNAL_MARKET_CACHE_TTL_MS) {
+        externalResolutionCache.delete(cacheKey);
+        return null;
+    }
+    return cached.resolution;
+}
+
+function rememberExternalResolution(query: string, resolution: ExternalMarketResolution) {
+    const now = Date.now();
+    const keys = new Set<string>([
+        normalizeResolutionCacheKey(query),
+        normalizeResolutionCacheKey(resolution.query),
+        normalizeResolutionCacheKey(resolution.symbol),
+        normalizeResolutionCacheKey(`$${resolution.symbol}`),
+    ]);
+
+    if (resolution.baseTokenAddress)
+        keys.add(normalizeResolutionCacheKey(resolution.baseTokenAddress));
+    if (resolution.pairAddress)
+        keys.add(normalizeResolutionCacheKey(resolution.pairAddress));
+
+    for (const key of keys) {
+        if (!key)
+            continue;
+        externalResolutionCache.set(key, { ts: now, resolution });
+    }
 }
 
 function pickBestDexPair(query: string, pairs: DexScreenerPair[]) {
@@ -431,31 +519,51 @@ async function fetchAlternativeMarketContext(query: string, timeframe: string, l
     if (cached && Date.now() - cached.ts < EXTERNAL_MARKET_CACHE_TTL_MS)
         return cached.payload;
 
-    const dexPayload = await fetchDexJson<{ pairs?: DexScreenerPair[] }>(resolveDexEndpoint(query));
-    const pairs = Array.isArray(dexPayload?.pairs) ? dexPayload.pairs.filter(pair => pair?.pairAddress && pair?.baseToken?.symbol) : [];
-    if (!pairs.length)
-        throw new Error(`No market data found for ${query}`);
+    let resolution = getCachedExternalResolution(query);
+    if (!resolution) {
+        const dexPayload = await fetchDexJson<{ pairs?: DexScreenerPair[] }>(resolveDexEndpoint(query));
+        const pairs = Array.isArray(dexPayload?.pairs) ? dexPayload.pairs.filter(pair => pair?.pairAddress && pair?.baseToken?.symbol) : [];
+        if (!pairs.length)
+            throw new Error(`No market data found for ${query}`);
 
-    const bestPair = pickBestDexPair(query, pairs);
-    const resolvedSymbol = normalizeMarketContextSymbol(bestPair.baseToken?.symbol) || normalizeMarketContextSymbol(query) || 'TOKEN';
-    const resolvedChain = resolveGeckoNetwork(bestPair.chainId);
-    const currentPrice = toFiniteNumber(bestPair.priceUsd);
-    const priceChange24h = toFiniteNumber(bestPair.priceChange?.h24);
-    const volume24h = toFiniteNumber(bestPair.volume?.h24);
-    const liquidityUsd = toFiniteNumber(bestPair.liquidity?.usd);
+        const bestPair = pickBestDexPair(query, pairs);
+        const resolvedSymbol = normalizeMarketContextSymbol(bestPair.baseToken?.symbol) || normalizeMarketContextSymbol(query) || 'TOKEN';
+        const resolvedChain = resolveGeckoNetwork(bestPair.chainId);
+        const currentPrice = toFiniteNumber(bestPair.priceUsd);
+        const priceChange24h = toFiniteNumber(bestPair.priceChange?.h24);
+        const volume24h = toFiniteNumber(bestPair.volume?.h24);
+        const liquidityUsd = toFiniteNumber(bestPair.liquidity?.usd);
+
+        resolution = {
+            query,
+            symbol: resolvedSymbol,
+            chainId: resolvedChain,
+            pairAddress: bestPair.pairAddress || null,
+            baseTokenAddress: bestPair.baseToken?.address || null,
+            baseTokenName: bestPair.baseToken?.name || null,
+            quoteSymbol: (bestPair.quoteToken?.symbol || 'USD').toUpperCase(),
+            currentPrice,
+            priceChange24h,
+            volume24h,
+            liquidityUsd,
+            provider: resolvedChain && bestPair.pairAddress ? 'geckoterminal' : 'dexscreener',
+            supportedOnJupiter: resolvedChain === 'solana' && Boolean(bestPair.baseToken?.address),
+        };
+        rememberExternalResolution(query, resolution);
+    }
 
     let candles: MarketContextCandle[] = [];
-    if (resolvedChain && bestPair.pairAddress) {
+    if (resolution.chainId && resolution.pairAddress) {
         try {
-            candles = await fetchGeckoCandles(resolvedChain, bestPair.pairAddress, timeframe, limit);
+            candles = await fetchGeckoCandles(resolution.chainId, resolution.pairAddress, timeframe, limit);
         }
         catch {
             candles = [];
         }
     }
 
-    if (!candles.length && currentPrice > 0)
-        candles = buildSyntheticCandles(currentPrice, timeframe, limit);
+    if (!candles.length && resolution.currentPrice > 0)
+        candles = buildSyntheticCandles(resolution.currentPrice, timeframe, limit);
 
     if (!candles.length)
         throw new Error(`No chart context available for ${query}`);
@@ -466,16 +574,15 @@ async function fetchAlternativeMarketContext(query: string, timeframe: string, l
     const fallbackChangePct = first.open > 0 ? ((last.close - first.open) / first.open) * 100 : 0;
     const high = Math.max(...sliced.map(candle => candle.high));
     const low = Math.min(...sliced.map(candle => candle.low));
-    const jupiterSupported = resolvedChain === 'solana' && Boolean(bestPair.baseToken?.address);
     const payload: MarketContextPayload = {
-        symbol: resolvedSymbol,
+        symbol: resolution.symbol,
         tf: timeframe,
-        provider: candles.length > 2 ? 'geckoterminal' : 'dexscreener',
+        provider: resolution.provider,
         venue: 'spot',
-        marketSymbol: resolvedSymbol,
-        quote: (bestPair.quoteToken?.symbol || 'USD').toUpperCase(),
-        price: currentPrice > 0 ? currentPrice : last.close,
-        changePct: Math.abs(priceChange24h) > 0 ? priceChange24h : fallbackChangePct,
+        marketSymbol: resolution.symbol,
+        quote: resolution.quoteSymbol,
+        price: resolution.currentPrice > 0 ? resolution.currentPrice : last.close,
+        changePct: Math.abs(resolution.priceChange24h) > 0 ? resolution.priceChange24h : fallbackChangePct,
         high,
         low,
         updatedAt: Date.now(),
@@ -483,14 +590,14 @@ async function fetchAlternativeMarketContext(query: string, timeframe: string, l
         funding: null,
         openInterest: null,
         supportedOnPacifica: false,
-        supportedOnJupiter: jupiterSupported,
-        executionVenue: jupiterSupported ? 'jupiter' : null,
-        chainId: resolvedChain || String(bestPair.chainId || ''),
-        baseTokenAddress: bestPair.baseToken?.address || null,
-        baseTokenName: bestPair.baseToken?.name || null,
-        pairAddress: bestPair.pairAddress || null,
-        liquidityUsd: liquidityUsd > 0 ? liquidityUsd : null,
-        volume24h: volume24h > 0 ? volume24h : null,
+        supportedOnJupiter: resolution.supportedOnJupiter,
+        executionVenue: resolution.supportedOnJupiter ? 'jupiter' : null,
+        chainId: resolution.chainId,
+        baseTokenAddress: resolution.baseTokenAddress,
+        baseTokenName: resolution.baseTokenName,
+        pairAddress: resolution.pairAddress,
+        liquidityUsd: resolution.liquidityUsd > 0 ? resolution.liquidityUsd : null,
+        volume24h: resolution.volume24h > 0 ? resolution.volume24h : null,
         requestQuery: query,
         tickSize: null,
         lotSize: null,
@@ -581,8 +688,9 @@ export async function fetchMarketContext(query: string, timeframe = '1h', limit 
     const resolvedTimeframe = SUPPORTED_INTERVALS.has(timeframe.toLowerCase()) ? timeframe.toLowerCase() : '1h';
     const boundedLimit = Math.min(Math.max(Math.trunc(limit), 48), 240);
     const normalizedSymbol = normalizeMarketContextSymbol(normalizedQuery);
+    const universeSnapshot = normalizedSymbol ? await getPacificaMarketUniverseSnapshot() : null;
 
-    if (normalizedSymbol && await isPacificaSupportedSymbol(normalizedSymbol))
+    if (normalizedSymbol && universeSnapshot?.byTicker.has(normalizedSymbol))
         return await fetchPacificaMarketContext(normalizedSymbol, resolvedTimeframe, boundedLimit);
 
     return await fetchAlternativeMarketContext(normalizedQuery, resolvedTimeframe, boundedLimit);
