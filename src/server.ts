@@ -1016,6 +1016,174 @@ export class AirificaServer {
             };
         };
 
+        const extractMarketQueryFromText = (text: string, fallbackSymbol?: string | null) => {
+            const raw = String(text || "").trim();
+            const addressMatch = raw.match(/\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{25,60})\b/);
+            if (addressMatch?.[1]) {
+                const normalized = normalizeMarketContextQuery(addressMatch[1]);
+                if (normalized)
+                    return normalized;
+            }
+
+            const dollarMatch = raw.match(/\$([a-zA-Z0-9]{2,12})\b/);
+            if (dollarMatch?.[1]) {
+                const normalized = normalizeMarketContextQuery(dollarMatch[1]);
+                if (normalized)
+                    return normalized;
+            }
+
+            if (fallbackSymbol) {
+                const normalized = normalizeMarketContextQuery(fallbackSymbol);
+                if (normalized)
+                    return normalized;
+            }
+
+            return "BTC";
+        };
+
+        const executeStoredProposal = async (
+            walletAddress: string,
+            proposalId: number,
+            requestedMarginUsd: number,
+            requestedLeverage: number,
+        ) => {
+            const proposal = this.stateStore.getProposal(proposalId);
+            if (!proposal)
+                throw new Error("proposal not found");
+            if (proposal.walletAddress !== walletAddress)
+                throw new Error("forbidden: wallet mismatch");
+            if (!["PROPOSED", "REJECTED"].includes(proposal.status))
+                throw new Error(`proposal already in status: ${proposal.status}`);
+
+            const binding = this.stateStore.getBinding(walletAddress);
+            if (!binding || !binding.isActive || !binding.builderApprovedAt || !binding.agentBoundAt) {
+                const error: any = new Error("Pacifica onboarding incomplete");
+                error.statusCode = 402;
+                error.payload = {
+                    ok: false,
+                    needsOnboarding: true,
+                    hint: "Pacifica onboarding incomplete. Connect wallet, approve AIRewardrop builder, bind the agent wallet, then fund the Pacifica account.",
+                    error: "Pacifica onboarding incomplete",
+                };
+                throw error;
+            }
+
+            const { ctx } = await requirePacificaExecutionContext(walletAddress);
+            const approvalState = await fetchBuilderApprovalState(ctx);
+            if (!approvalState.hasApproval || !approvalState.hasSufficientFeeCap) {
+                const error: any = new Error("Pacifica builder approval not ready for execution");
+                error.statusCode = 409;
+                error.payload = {
+                    ok: false,
+                    needsOnboarding: true,
+                    hint: approvalState.hint,
+                    error: "Pacifica builder approval not ready for execution",
+                };
+                throw error;
+            }
+
+            this.stateStore.updateProposal(proposalId, { status: "APPROVED" });
+
+            const pacificaSide: "bid" | "ask" = proposal.proposal.side === "LONG" ? "bid" : "ask";
+            const leverage = Number.isFinite(requestedLeverage) && requestedLeverage > 0 ? requestedLeverage : 1;
+            const marginUsd = Number.isFinite(requestedMarginUsd) && requestedMarginUsd > 0 ? requestedMarginUsd : AIRIFICA_DEFAULT_NOTIONAL_USD;
+            const requestedNotional = marginUsd * leverage;
+            const size = proposal.proposal.entry > 0 ? requestedNotional / proposal.proposal.entry : 0;
+            if (!Number.isFinite(size) || size <= 0) {
+                this.stateStore.updateProposal(proposalId, { status: "FAILED", errorMessage: "invalid size from entry price" });
+                const error: any = new Error("invalid size from entry price");
+                error.statusCode = 400;
+                error.payload = { ok: false, error: "invalid size from entry price" };
+                throw error;
+            }
+
+            const takeProfit = proposal.proposal.tp
+                ? {
+                    stop_price: String(Number(proposal.proposal.tp)),
+                    limit_price: String(Number(proposal.proposal.tp)),
+                }
+                : undefined;
+            const stopLoss = proposal.proposal.sl
+                ? {
+                    stop_price: String(Number(proposal.proposal.sl)),
+                    limit_price: String(Number(proposal.proposal.sl)),
+                }
+                : undefined;
+
+            try {
+                const orderResult = await createMarketOrderForContext(ctx, {
+                    symbol: proposal.proposal.symbol,
+                    side: pacificaSide,
+                    size,
+                    requestedNotionalUsd: requestedNotional,
+                    reduce_only: false,
+                    ...(takeProfit ? { take_profit: takeProfit } : {}),
+                    ...(stopLoss ? { stop_loss: stopLoss } : {}),
+                });
+                const orderId = extractPacificaOrderId(orderResult);
+                this.stateStore.updateProposal(proposalId, {
+                    status: "EXECUTED",
+                    orderId,
+                    errorMessage: null,
+                });
+                queueTelegramTradeAlert(
+                    walletAddress,
+                    `Opened ${proposal.proposal.side} ${proposal.proposal.symbol} from Airifica${orderId ? ` (${orderId})` : ""}.`,
+                    "TRADE_OPENED",
+                );
+
+                return {
+                    ok: true,
+                    orderId,
+                    pacificaResponse: orderResult,
+                    proposal,
+                    leverage,
+                    marginUsd,
+                };
+            } catch (err: any) {
+                const message = err?.message || "server error";
+                if (isPacificaBetaAccessError(message)) {
+                    this.stateStore.updateProposal(proposalId, {
+                        status: "FAILED",
+                        errorMessage: "Pacifica beta access required",
+                    });
+                    const error: any = new Error("Pacifica beta access required");
+                    error.statusCode = 403;
+                    error.payload = {
+                        ok: false,
+                        error: "Pacifica beta access required",
+                        hint: buildPacificaBetaAccessHint(),
+                        redeemUrl: PACIFICA_BETA_ACCESS_URL,
+                        requiresBetaAccess: true,
+                    };
+                    throw error;
+                }
+                if (/builder approval/i.test(message) || /max_fee_rate/i.test(message)) {
+                    const error: any = new Error("Pacifica builder approval not ready for execution");
+                    error.statusCode = 409;
+                    error.payload = {
+                        ok: false,
+                        needsOnboarding: true,
+                        hint: message,
+                        error: "Pacifica builder approval not ready for execution",
+                    };
+                    throw error;
+                }
+                if (/requires at least .* USD notional/i.test(message) || /too small for lot/i.test(message)) {
+                    const error: any = new Error(message);
+                    error.statusCode = 400;
+                    error.payload = { ok: false, error: message, hint: message };
+                    throw error;
+                }
+
+                this.stateStore.updateProposal(proposalId, {
+                    status: "FAILED",
+                    errorMessage: message,
+                });
+                throw err;
+            }
+        };
+
         /** POST /api/airi3/session */
         this.app.post("/api/airi3/session", async (req: Request, res: Response) => {
             try {
@@ -1543,6 +1711,203 @@ export class AirificaServer {
             }
         });
 
+        this.app.post("/api/airi3/telegram/internal/proposals/prepare", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                const link = this.stateStore.getTelegramLink(chatId);
+                if (!link) {
+                    res.status(404).json({ ok: false, error: "Telegram chat is not linked to any wallet" });
+                    return;
+                }
+
+                const rawProposal = req.body?.proposal || {};
+                const symbol = String(rawProposal.symbol || "").trim().toUpperCase();
+                const side = String(rawProposal.side || "").trim().toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+                const entry = Number(rawProposal.entry);
+                const tp = Number(rawProposal.tp);
+                const sl = Number(rawProposal.sl);
+                if (!symbol || !Number.isFinite(entry) || !Number.isFinite(tp) || !Number.isFinite(sl)) {
+                    res.status(400).json({ ok: false, error: "invalid proposal payload" });
+                    return;
+                }
+
+                const sourceText = String(req.body?.sourceText || "").trim();
+                const marketQuery = extractMarketQueryFromText(sourceText, symbol);
+                const market = await fetchMarketContext(marketQuery, "1h", 96);
+                const summary = await buildTelegramWalletSummary(link.walletAddress);
+
+                if (market.executionVenue === "pacifica" && market.supportedOnPacifica) {
+                    const proposal = this.stateStore.createProposal(link.walletAddress, `tg_${chatId}`, {
+                        symbol,
+                        side,
+                        entry,
+                        tp,
+                        sl,
+                        timeframe: String(rawProposal.timeframe || "1H"),
+                        confidence: Number.isFinite(Number(rawProposal.confidence)) ? Number(rawProposal.confidence) : 0.6,
+                        thesis: String(rawProposal.thesis || "").slice(0, 500),
+                        sourceAction: String(rawProposal.sourceAction || "AIRIFICA_TELEGRAM"),
+                    }, {
+                        marketQuery,
+                        executionVenue: market.executionVenue,
+                        supportedOnPacifica: market.supportedOnPacifica,
+                        supportedOnJupiter: market.supportedOnJupiter,
+                        baseTokenAddress: market.baseTokenAddress,
+                        pairAddress: market.pairAddress,
+                        maxLeverage: market.maxLeverage,
+                    });
+
+                    res.json({
+                        ok: true,
+                        kind: "pacifica",
+                        proposalId: proposal.id,
+                        availableUsd: summary.availableUsd,
+                        maxLeverage: market.maxLeverage || 1,
+                        proposal: proposal.proposal,
+                        market: {
+                            symbol: market.symbol,
+                            executionVenue: market.executionVenue,
+                            minOrderSize: market.minOrderSize,
+                            lotSize: market.lotSize,
+                        },
+                    });
+                    return;
+                }
+
+                res.json({
+                    ok: true,
+                    kind: market.supportedOnJupiter ? "jupiter" : "external",
+                    proposal: {
+                        symbol,
+                        side,
+                        entry,
+                        tp,
+                        sl,
+                        timeframe: String(rawProposal.timeframe || "1H"),
+                        confidence: Number.isFinite(Number(rawProposal.confidence)) ? Number(rawProposal.confidence) : 0.6,
+                    },
+                    market: {
+                        symbol: market.symbol,
+                        executionVenue: market.executionVenue,
+                        supportedOnPacifica: market.supportedOnPacifica,
+                        supportedOnJupiter: market.supportedOnJupiter,
+                        baseTokenAddress: market.baseTokenAddress,
+                    },
+                });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/proposals/prepare error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/internal/proposals/:id", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                const link = this.stateStore.getTelegramLink(chatId);
+                if (!link) {
+                    res.status(404).json({ ok: false, error: "Telegram chat is not linked to any wallet" });
+                    return;
+                }
+
+                const proposalId = Number(req.params.id);
+                if (!Number.isFinite(proposalId)) {
+                    res.status(400).json({ ok: false, error: "invalid proposal id" });
+                    return;
+                }
+
+                const proposal = this.stateStore.getProposal(proposalId);
+                if (!proposal || proposal.walletAddress !== link.walletAddress) {
+                    res.status(404).json({ ok: false, error: "proposal not found" });
+                    return;
+                }
+
+                const summary = await buildTelegramWalletSummary(link.walletAddress);
+                res.json({
+                    ok: true,
+                    proposal: {
+                        id: proposal.id,
+                        status: proposal.status,
+                        data: proposal.proposal,
+                        executionVenue: proposal.executionVenue || null,
+                        supportedOnPacifica: proposal.supportedOnPacifica || false,
+                        supportedOnJupiter: proposal.supportedOnJupiter || false,
+                        baseTokenAddress: proposal.baseTokenAddress || null,
+                        maxLeverage: proposal.maxLeverage || 1,
+                    },
+                    availableUsd: summary.availableUsd,
+                });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/proposals/:id error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/internal/proposals/:id/approve", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                const link = this.stateStore.getTelegramLink(chatId);
+                if (!link) {
+                    res.status(404).json({ ok: false, error: "Telegram chat is not linked to any wallet" });
+                    return;
+                }
+
+                const proposalId = Number(req.params.id);
+                if (!Number.isFinite(proposalId)) {
+                    res.status(400).json({ ok: false, error: "invalid proposal id" });
+                    return;
+                }
+
+                const proposal = this.stateStore.getProposal(proposalId);
+                if (!proposal || proposal.walletAddress !== link.walletAddress) {
+                    res.status(404).json({ ok: false, error: "proposal not found" });
+                    return;
+                }
+                if (proposal.executionVenue !== "pacifica" || !proposal.supportedOnPacifica) {
+                    res.status(409).json({ ok: false, error: "proposal is not executable on Pacifica from Telegram" });
+                    return;
+                }
+
+                const summary = await buildTelegramWalletSummary(link.walletAddress);
+                const pct = Math.min(100, Math.max(1, Number(req.body?.collateral_pct || 10)));
+                const leverage = Math.min(
+                    Math.max(1, Number(proposal.maxLeverage || 1)),
+                    Math.max(1, Number(req.body?.leverage || 1)),
+                );
+                const availableUsd = Number(summary.availableUsd || 0);
+                const marginUsd = Math.min(availableUsd, availableUsd * (pct / 100));
+                if (!Number.isFinite(marginUsd) || marginUsd <= 0) {
+                    res.status(400).json({ ok: false, error: "No available collateral to execute this trade" });
+                    return;
+                }
+
+                const result = await executeStoredProposal(link.walletAddress, proposalId, marginUsd, leverage);
+                res.json({
+                    ok: true,
+                    orderId: result.orderId,
+                    leverage,
+                    marginUsd,
+                    symbol: result.proposal.proposal.symbol,
+                    side: result.proposal.proposal.side,
+                });
+            } catch (err: any) {
+                if (err?.payload && err?.statusCode) {
+                    res.status(err.statusCode).json(err.payload);
+                    return;
+                }
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/proposals/:id/approve error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
         this.app.get("/api/airi3/market-context", async (req: Request, res: Response) => {
             try {
                 const rawSymbol = Array.isArray(req.query.symbol) ? req.query.symbol[0] : req.query.symbol;
@@ -1624,136 +1989,23 @@ export class AirificaServer {
             if (!auth)
                 return;
 
-            let proposalId = Number.NaN;
             try {
-                proposalId = Number(req.params.id);
+                const proposalId = Number(req.params.id);
                 if (!Number.isFinite(proposalId)) {
                     res.status(400).json({ ok: false, error: "invalid id" });
                     return;
                 }
-
-                const proposal = this.stateStore.getProposal(proposalId);
-                if (!proposal) {
-                    res.status(404).json({ ok: false, error: "proposal not found" });
-                    return;
-                }
-                if (proposal.walletAddress !== auth.address) {
-                    res.status(403).json({ ok: false, error: "forbidden: wallet mismatch" });
-                    return;
-                }
-                if (!["PROPOSED", "REJECTED"].includes(proposal.status)) {
-                    res.status(409).json({ ok: false, error: `proposal already in status: ${proposal.status}` });
-                    return;
-                }
-
-                const binding = this.stateStore.getBinding(auth.address);
-                if (!binding || !binding.isActive || !binding.builderApprovedAt || !binding.agentBoundAt) {
-                    res.status(402).json({
-                        ok: false,
-                        needsOnboarding: true,
-                        hint: "Pacifica onboarding incomplete. Connect wallet, approve AIRewardrop builder, bind the agent wallet, then fund the Pacifica account.",
-                        error: "Pacifica onboarding incomplete",
-                    });
-                    return;
-                }
-
-                const { ctx } = await requirePacificaExecutionContext(auth.address);
-                const approvalState = await fetchBuilderApprovalState(ctx);
-                if (!approvalState.hasApproval || !approvalState.hasSufficientFeeCap) {
-                    res.status(409).json({
-                        ok: false,
-                        needsOnboarding: true,
-                        hint: approvalState.hint,
-                        error: "Pacifica builder approval not ready for execution",
-                    });
-                    return;
-                }
-                this.stateStore.updateProposal(proposalId, { status: "APPROVED" });
-
-                const pacificaSide: "bid" | "ask" = proposal.proposal.side === "LONG" ? "bid" : "ask";
                 const requestedMarginUsd = Number(req.body?.notional_usd || AIRIFICA_DEFAULT_NOTIONAL_USD);
                 const requestedLeverage = Number(req.body?.leverage || 1);
-                const leverage = Number.isFinite(requestedLeverage) && requestedLeverage > 0 ? requestedLeverage : 1;
-                const requestedNotional = requestedMarginUsd * leverage;
-                const size = proposal.proposal.entry > 0 ? requestedNotional / proposal.proposal.entry : 0;
-                if (!Number.isFinite(size) || size <= 0) {
-                    this.stateStore.updateProposal(proposalId, { status: "FAILED", errorMessage: "invalid size from entry price" });
-                    res.status(400).json({ ok: false, error: "invalid size from entry price" });
-                    return;
-                }
-
-                const takeProfit = proposal.proposal.tp
-                    ? {
-                        stop_price: String(Number(proposal.proposal.tp)),
-                        limit_price: String(Number(proposal.proposal.tp)),
-                    }
-                    : undefined;
-                const stopLoss = proposal.proposal.sl
-                    ? {
-                        stop_price: String(Number(proposal.proposal.sl)),
-                        limit_price: String(Number(proposal.proposal.sl)),
-                    }
-                    : undefined;
-
-                const orderResult = await createMarketOrderForContext(ctx, {
-                    symbol: proposal.proposal.symbol,
-                    side: pacificaSide,
-                    size,
-                    requestedNotionalUsd: requestedNotional,
-                    reduce_only: false,
-                    ...(takeProfit ? { take_profit: takeProfit } : {}),
-                    ...(stopLoss ? { stop_loss: stopLoss } : {}),
-                });
-                const orderId = extractPacificaOrderId(orderResult);
-                this.stateStore.updateProposal(proposalId, {
-                    status: "EXECUTED",
-                    orderId,
-                    errorMessage: null,
-                });
-                queueTelegramTradeAlert(
-                    auth.address,
-                    `Opened ${proposal.proposal.side} ${proposal.proposal.symbol} from Airifica frontend${orderId ? ` (${orderId})` : ""}.`,
-                    "TRADE_OPENED",
-                );
-
-                res.json({
-                    ok: true,
-                    orderId,
-                    pacificaResponse: orderResult,
-                });
+                const result = await executeStoredProposal(auth.address, proposalId, requestedMarginUsd, requestedLeverage);
+                res.json({ ok: true, orderId: result.orderId, pacificaResponse: result.pacificaResponse });
             } catch (err: any) {
+                if (err?.payload && err?.statusCode) {
+                    res.status(err.statusCode).json(err.payload);
+                    return;
+                }
                 elizaLogger.error("[client-airifica] /api/airi3/proposals/:id/approve error:", err);
-                const message = err?.message || "server error";
-                if (isPacificaBetaAccessError(message)) {
-                    if (Number.isFinite(proposalId)) {
-                        this.stateStore.updateProposal(proposalId, {
-                            status: "FAILED",
-                            errorMessage: "Pacifica beta access required",
-                        });
-                    }
-                    res.status(403).json({
-                        ok: false,
-                        error: "Pacifica beta access required",
-                        hint: buildPacificaBetaAccessHint(),
-                        redeemUrl: PACIFICA_BETA_ACCESS_URL,
-                        requiresBetaAccess: true,
-                    });
-                    return;
-                }
-                if (/builder approval/i.test(message) || /max_fee_rate/i.test(message)) {
-                    res.status(409).json({
-                        ok: false,
-                        needsOnboarding: true,
-                        hint: message,
-                        error: "Pacifica builder approval not ready for execution",
-                    });
-                    return;
-                }
-                if (/requires at least .* USD notional/i.test(message) || /too small for lot/i.test(message)) {
-                    res.status(400).json({ ok: false, error: message, hint: message });
-                    return;
-                }
-                res.status(500).json({ ok: false, error: message });
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
             }
         });
 

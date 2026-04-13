@@ -22,6 +22,13 @@ export interface TradeProposalRecord {
     walletAddress: string;
     conversationId: string;
     proposal: TradeProposal;
+    marketQuery?: string | null;
+    executionVenue?: 'pacifica' | 'jupiter' | null;
+    supportedOnPacifica?: boolean;
+    supportedOnJupiter?: boolean;
+    baseTokenAddress?: string | null;
+    pairAddress?: string | null;
+    maxLeverage?: number | null;
     status: 'PROPOSED' | 'APPROVED' | 'EXECUTED' | 'FAILED' | 'REJECTED';
     errorMessage: string | null;
     orderId: string | null;
@@ -178,7 +185,15 @@ export class AirificaStateStore {
         return next;
     }
 
-    createProposal(walletAddress: string, conversationId: string, proposal: TradeProposal) {
+    createProposal(
+        walletAddress: string,
+        conversationId: string,
+        proposal: TradeProposal,
+        options?: Partial<Pick<
+            TradeProposalRecord,
+            'marketQuery' | 'executionVenue' | 'supportedOnPacifica' | 'supportedOnJupiter' | 'baseTokenAddress' | 'pairAddress' | 'maxLeverage'
+        >>
+    ) {
         const id = this.state.nextProposalId++;
         const now = Date.now();
         const record: TradeProposalRecord = {
@@ -186,6 +201,13 @@ export class AirificaStateStore {
             walletAddress,
             conversationId,
             proposal,
+            marketQuery: options?.marketQuery ?? null,
+            executionVenue: options?.executionVenue ?? null,
+            supportedOnPacifica: options?.supportedOnPacifica ?? false,
+            supportedOnJupiter: options?.supportedOnJupiter ?? false,
+            baseTokenAddress: options?.baseTokenAddress ?? null,
+            pairAddress: options?.pairAddress ?? null,
+            maxLeverage: options?.maxLeverage ?? null,
             status: 'PROPOSED',
             errorMessage: null,
             orderId: null,
