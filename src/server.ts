@@ -1052,7 +1052,7 @@ export class AirificaServer {
                 throw new Error("proposal not found");
             if (proposal.walletAddress !== walletAddress)
                 throw new Error("forbidden: wallet mismatch");
-            if (!["PROPOSED", "REJECTED"].includes(proposal.status))
+            if (!["PROPOSED", "REJECTED", "FAILED"].includes(proposal.status))
                 throw new Error(`proposal already in status: ${proposal.status}`);
 
             const binding = this.stateStore.getBinding(walletAddress);
@@ -1833,6 +1833,7 @@ export class AirificaServer {
                     proposal: {
                         id: proposal.id,
                         status: proposal.status,
+                        errorMessage: proposal.errorMessage,
                         data: proposal.proposal,
                         executionVenue: proposal.executionVenue || null,
                         supportedOnPacifica: proposal.supportedOnPacifica || false,
