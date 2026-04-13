@@ -73,6 +73,7 @@ const AIRIFICA_TELEGRAM_INTERNAL_SECRET = String(
     || envValue("TELEGRAM_BOT_TOKEN")
     || "",
 ).trim();
+const AIRIFICA_TELEGRAM_NOTIFY_BASE_URL = AIRIFICA_PUBLIC_APP_URL || null;
 
 const parseOriginList = (value: string) =>
     value
@@ -98,6 +99,10 @@ function applySecurityHeaders(res: Response) {
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
+}
+
+function compact(text: string) {
+    return text.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function assertSecurityConfiguration() {
@@ -643,6 +648,44 @@ export class AirificaServer {
             return `https://t.me/${AIRIFICA_TELEGRAM_BOT_USERNAME}?start=link_${code}`;
         };
 
+        const buildTelegramTradeAlertText = (payload: {
+            venue?: string | null;
+            symbol: string;
+            side?: string | null;
+            amountUsd?: number | null;
+            quantity?: number | null;
+            txSignature?: string | null;
+            explorerUrl?: string | null;
+        }) => {
+            const venue = String(payload.venue || "frontend").trim();
+            const symbol = normalizeSymbol(payload.symbol || "");
+            const side = normalizePacificaSide(payload.side || "", null) || String(payload.side || "").trim().toUpperCase() || "TRADE";
+            const amountUsd = Number(payload.amountUsd);
+            const quantity = Number(payload.quantity);
+            const lines = [
+                `Opened ${side} ${symbol}${venue ? ` via ${venue}` : ""}.`,
+            ];
+
+            const facts: string[] = [];
+            if (Number.isFinite(amountUsd) && amountUsd > 0)
+                facts.push(`Notional: ${amountUsd.toFixed(2)} USD`);
+            if (Number.isFinite(quantity) && quantity > 0)
+                facts.push(`Size: ${quantity.toFixed(6)}`);
+            if (facts.length)
+                lines.push(facts.join(" · "));
+
+            if (payload.explorerUrl) {
+                lines.push(payload.explorerUrl);
+            } else if (payload.txSignature) {
+                lines.push(`https://solscan.io/tx/${payload.txSignature}`);
+            }
+
+            if (AIRIFICA_TELEGRAM_NOTIFY_BASE_URL)
+                lines.push(AIRIFICA_TELEGRAM_NOTIFY_BASE_URL);
+
+            return compact(lines.join("\n"));
+        };
+
         const requirePacificaExecutionContext = async (walletAddress: string) => {
             const binding = this.stateStore.getBinding(walletAddress);
             if (!binding) {
@@ -1100,6 +1143,100 @@ export class AirificaServer {
             }
         });
 
+        this.app.post("/api/airi3/telegram/link/preferences", async (req: Request, res: Response) => {
+            const auth = requireAuth(req, res);
+            if (!auth)
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                if (!chatId) {
+                    res.status(400).json({ ok: false, error: "chatId required" });
+                    return;
+                }
+
+                const link = this.stateStore.getTelegramLink(chatId);
+                if (!link || link.walletAddress !== auth.address) {
+                    res.status(404).json({ ok: false, error: "Telegram link not found" });
+                    return;
+                }
+
+                const updated = this.stateStore.updateTelegramLink(chatId, {
+                    ...(typeof req.body?.alertsEnabled === "boolean" ? { alertsEnabled: req.body.alertsEnabled } : {}),
+                    ...(typeof req.body?.conversationalEnabled === "boolean" ? { conversationalEnabled: req.body.conversationalEnabled } : {}),
+                });
+
+                if (!updated) {
+                    res.status(404).json({ ok: false, error: "Telegram link not found" });
+                    return;
+                }
+
+                res.json({ ok: true, link: updated });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/link/preferences error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/link/unlink", async (req: Request, res: Response) => {
+            const auth = requireAuth(req, res);
+            if (!auth)
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                if (!chatId) {
+                    res.status(400).json({ ok: false, error: "chatId required" });
+                    return;
+                }
+
+                const link = this.stateStore.getTelegramLink(chatId);
+                if (!link || link.walletAddress !== auth.address) {
+                    res.status(404).json({ ok: false, error: "Telegram link not found" });
+                    return;
+                }
+
+                this.stateStore.deleteTelegramLink(chatId);
+                res.json({ ok: true });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/link/unlink error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/notify/trade", async (req: Request, res: Response) => {
+            const auth = requireAuth(req, res);
+            if (!auth)
+                return;
+
+            try {
+                const symbol = normalizeSymbol(req.body?.symbol || "");
+                if (!symbol) {
+                    res.status(400).json({ ok: false, error: "symbol required" });
+                    return;
+                }
+
+                const text = buildTelegramTradeAlertText({
+                    venue: String(req.body?.venue || "frontend").trim() || "frontend",
+                    symbol,
+                    side: req.body?.side ? String(req.body.side) : null,
+                    amountUsd: req.body?.amountUsd != null ? Number(req.body.amountUsd) : null,
+                    quantity: req.body?.quantity != null ? Number(req.body.quantity) : null,
+                    txSignature: req.body?.txSignature ? String(req.body.txSignature) : null,
+                    explorerUrl: req.body?.explorerUrl ? String(req.body.explorerUrl) : null,
+                });
+
+                const notifications = this.stateStore.createTelegramNotifications(auth.address, "TRADE_OPENED", text);
+                res.json({
+                    ok: true,
+                    queued: notifications.length,
+                });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/notify/trade error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
         this.app.post("/api/airi3/telegram/internal/link/consume", async (req: Request, res: Response) => {
             if (!requireTelegramInternal(req, res))
                 return;
@@ -1199,6 +1336,31 @@ export class AirificaServer {
                 res.json({ ok: true, alertsEnabled: updated.alertsEnabled });
             } catch (err: any) {
                 elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/alerts/toggle error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/internal/chat/toggle", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                const enabled = Boolean(req.body?.enabled);
+                if (!chatId) {
+                    res.status(400).json({ ok: false, error: "chatId required" });
+                    return;
+                }
+
+                const updated = this.stateStore.updateTelegramLink(chatId, { conversationalEnabled: enabled });
+                if (!updated) {
+                    res.status(404).json({ ok: false, error: "Telegram link not found" });
+                    return;
+                }
+
+                res.json({ ok: true, conversationalEnabled: updated.conversationalEnabled });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/chat/toggle error:", err);
                 res.status(500).json({ ok: false, error: err?.message || "server error" });
             }
         });
@@ -1324,6 +1486,10 @@ export class AirificaServer {
                 const link = this.stateStore.getTelegramLink(chatId);
                 if (!link) {
                     res.status(404).json({ ok: false, error: "Telegram chat is not linked to any wallet" });
+                    return;
+                }
+                if (!link.conversationalEnabled) {
+                    res.status(403).json({ ok: false, error: "Telegram conversation is disabled for this chat" });
                     return;
                 }
 
