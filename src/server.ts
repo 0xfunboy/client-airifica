@@ -2,6 +2,7 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
+import { Connection, PublicKey } from "@solana/web3.js";
 import { elizaLogger } from "@elizaos/core";
 import type { IAgentRuntime } from "@elizaos/core";
 import {
@@ -75,12 +76,14 @@ const AIRIFICA_TELEGRAM_INTERNAL_SECRET = String(
     || "",
 ).trim();
 const AIRIFICA_TELEGRAM_NOTIFY_BASE_URL = AIRIFICA_PUBLIC_APP_URL || null;
+const SOLANA_RPC_URL = (envValue("SOLANA_RPC_URL", process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com")).trim();
 const AIRIFICA_ADMIN_WALLETS = new Set(
     envValue("ADMIN_WALLETS")
         .split(/[,\s]+/)
         .map(value => value.trim())
         .filter(Boolean),
 );
+const solanaConnection = SOLANA_RPC_URL ? new Connection(SOLANA_RPC_URL, "confirmed") : null;
 
 const parseOriginList = (value: string) =>
     value
@@ -437,10 +440,55 @@ function extractPacificaOrderId(result: unknown) {
     return String(candidate);
 }
 
+async function readSpotTokenBalance(walletAddress: string, mintAddress: string) {
+    if (!solanaConnection || !isValidSolanaAddress(walletAddress) || !isValidSolanaAddress(mintAddress))
+        return null;
+
+    try {
+        const owner = new PublicKey(walletAddress);
+        const mint = new PublicKey(mintAddress);
+        const accounts = await solanaConnection.getParsedTokenAccountsByOwner(owner, { mint });
+        let quantity = 0;
+        let decimals = 0;
+
+        for (const account of accounts.value) {
+            const tokenAmount = (account.account.data as any)?.parsed?.info?.tokenAmount;
+            const uiAmountString = tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? "0";
+            const numeric = Number(uiAmountString);
+            if (Number.isFinite(numeric))
+                quantity += numeric;
+            const parsedDecimals = Number(tokenAmount?.decimals);
+            if (Number.isFinite(parsedDecimals))
+                decimals = parsedDecimals;
+        }
+
+        return {
+            quantity,
+            decimals,
+        };
+    } catch (error) {
+        elizaLogger.warn("[client-airifica] onchain token balance lookup failed:", {
+            walletAddress,
+            mintAddress,
+            error,
+        });
+        return null;
+    }
+}
+
 function sanitizePacificaKnowledgePayload(overview: {
     status: Record<string, unknown>;
     account: ReturnType<typeof mapPacificaAccountSnapshot> | null;
     positions: ReturnType<typeof mapPacificaPosition>[];
+    onchainPositions?: Array<{
+        symbol: string;
+        mintAddress: string;
+        quantity: number;
+        priceUsd: number | null;
+        valueUsd: number | null;
+        provider: string | null;
+        updatedAt: number;
+    }>;
     accountMissing?: boolean;
     minimumDepositUsd?: number | null;
     onboardingHint?: string | null;
@@ -484,6 +532,17 @@ function sanitizePacificaKnowledgePayload(overview: {
             isolated: position.isolated,
             updated_at: position.updatedAt,
         })),
+        onchain_positions: Array.isArray(overview.onchainPositions)
+            ? overview.onchainPositions.map(position => ({
+                symbol: position.symbol,
+                mint_address: position.mintAddress,
+                quantity: position.quantity,
+                price_usd: position.priceUsd,
+                value_usd: position.valueUsd,
+                provider: position.provider,
+                updated_at: position.updatedAt,
+            }))
+            : [],
     };
 }
 
@@ -824,6 +883,7 @@ export class AirificaServer {
                     readyToExecute: false,
                 }
                 : localStatus;
+            const onchainPositions = await buildOnchainSpotPositions(walletAddress);
 
             if (!binding || !status.readyToExecute) {
                 return {
@@ -831,6 +891,7 @@ export class AirificaServer {
                     status,
                     account: null,
                     positions: [],
+                    onchainPositions,
                     accountMissing: false,
                     minimumDepositUsd: PACIFICA_MIN_DEPOSIT_USD,
                     onboardingHint: builderApprovalState && (!builderApprovalState.hasApproval || !builderApprovalState.hasSufficientFeeCap)
@@ -855,6 +916,7 @@ export class AirificaServer {
                         status,
                         account: null,
                         positions: [],
+                        onchainPositions,
                         accountMissing: true,
                         minimumDepositUsd: PACIFICA_MIN_DEPOSIT_USD,
                         onboardingHint: `Open Pacifica with AIRewardrop and deposit at least ${PACIFICA_MIN_DEPOSIT_USD} USDC to initialize this account.`,
@@ -898,10 +960,65 @@ export class AirificaServer {
                 status,
                 account: mapPacificaAccountSnapshot(accountSnapshot),
                 positions,
+                onchainPositions,
                 accountMissing: false,
                 minimumDepositUsd: PACIFICA_MIN_DEPOSIT_USD,
                 onboardingHint: null,
             };
+        };
+
+        const buildOnchainSpotPositions = async (walletAddress: string) => {
+            const watches = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
+            if (!watches.length)
+                return [];
+
+            const positions = await Promise.all(watches.map(async (watch) => {
+                if (!watch.mintAddress)
+                    return null;
+
+                const balance = await readSpotTokenBalance(walletAddress, watch.mintAddress);
+                const quantity = Number(balance?.quantity || 0);
+                if (!Number.isFinite(quantity) || quantity <= 0)
+                    return null;
+
+                let market: Awaited<ReturnType<typeof fetchMarketContext>> | null = null;
+                try {
+                    market = await fetchMarketContext(watch.marketQuery || watch.mintAddress, "15m", 96);
+                } catch (error) {
+                    elizaLogger.warn("[client-airifica] onchain market context lookup skipped:", {
+                        walletAddress,
+                        mintAddress: watch.mintAddress,
+                        error,
+                    });
+                }
+
+                const priceUsd = Number(market?.price);
+                const normalizedPrice = Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
+                const valueUsd = normalizedPrice != null ? normalizedPrice * quantity : null;
+
+                return {
+                    symbol: market?.symbol || watch.symbol || "TOKEN",
+                    mintAddress: watch.mintAddress,
+                    quantity,
+                    decimals: Number(balance?.decimals || 0),
+                    priceUsd: normalizedPrice,
+                    valueUsd,
+                    provider: market?.provider || null,
+                    marketQuery: watch.marketQuery || watch.mintAddress,
+                    lastTradeAt: watch.lastTradeAt || watch.updatedAt,
+                    lastTxSignature: watch.lastTxSignature,
+                    updatedAt: watch.updatedAt,
+                };
+            }));
+
+            return positions
+                .filter((position): position is NonNullable<typeof position> => Boolean(position))
+                .sort((left, right) => {
+                    const valueDelta = Number(right.valueUsd || 0) - Number(left.valueUsd || 0);
+                    if (valueDelta !== 0)
+                        return valueDelta;
+                    return Number(right.updatedAt || 0) - Number(left.updatedAt || 0);
+                });
         };
 
         const closePacificaPositionForWallet = async (
@@ -1039,8 +1156,28 @@ export class AirificaServer {
             await maybePrimePacificaKnowledge(walletAddress, overview);
             const account = overview.account;
             const positions = Array.isArray(overview.positions) ? overview.positions : [];
+            const onchainPositions = Array.isArray((overview as any).onchainPositions) ? (overview as any).onchainPositions : [];
             const totalPnlUsd = positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0);
             const latestTrade = this.stateStore.getLatestExecutedProposalForWallet(walletAddress);
+            const latestOnchainTrade = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress)
+                .sort((left, right) => Number(right.lastTradeAt || right.updatedAt) - Number(left.lastTradeAt || left.updatedAt))[0] || null;
+            const effectiveLatestTrade = latestOnchainTrade && (!latestTrade || Number(latestOnchainTrade.lastTradeAt || 0) >= Number(latestTrade.updatedAt || 0))
+                ? {
+                    symbol: latestOnchainTrade.symbol || "TOKEN",
+                    side: "LONG",
+                    orderId: latestOnchainTrade.lastTxSignature,
+                    updatedAt: latestOnchainTrade.lastTradeAt || latestOnchainTrade.updatedAt,
+                    venue: "jupiter",
+                }
+                : latestTrade
+                    ? {
+                        symbol: latestTrade.proposal.symbol,
+                        side: latestTrade.proposal.side,
+                        orderId: latestTrade.orderId,
+                        updatedAt: latestTrade.updatedAt,
+                        venue: latestTrade.executionVenue || "pacifica",
+                    }
+                    : null;
 
             return {
                 walletAddress,
@@ -1048,15 +1185,10 @@ export class AirificaServer {
                 availableUsd: account ? Number(account.availableToSpend || 0) : 0,
                 withdrawableUsd: account ? Number(account.availableToWithdraw || 0) : 0,
                 positionsCount: positions.length,
+                onchainPositionsCount: onchainPositions.length,
+                onchainValueUsd: onchainPositions.reduce((sum: number, position: any) => sum + Number(position.valueUsd || 0), 0),
                 totalPnlUsd,
-                latestTrade: latestTrade
-                    ? {
-                        symbol: latestTrade.proposal.symbol,
-                        side: latestTrade.proposal.side,
-                        orderId: latestTrade.orderId,
-                        updatedAt: latestTrade.updatedAt,
-                    }
-                    : null,
+                latestTrade: effectiveLatestTrade,
             };
         };
 
@@ -1783,6 +1915,18 @@ export class AirificaServer {
 
                 const notifications = this.stateStore.createTelegramNotifications(auth.address, "TRADE_OPENED", text);
                 const amountUsd = Number(req.body?.amountUsd);
+                const outputMint = String(req.body?.outputMint || "").trim();
+                const marketQuery = normalizeMarketContextQuery(req.body?.marketQuery || outputMint || symbol) || symbol;
+                if (outputMint && String(req.body?.venue || "").trim().toLowerCase().includes("jupiter")) {
+                    this.stateStore.upsertOnchainSpotWatch(auth.address, outputMint, {
+                        symbol,
+                        marketQuery,
+                        lastTradeAt: Date.now(),
+                        lastTxSignature: req.body?.txSignature ? String(req.body.txSignature) : null,
+                        lastNotionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
+                        lastQuantity: req.body?.quantity != null && Number.isFinite(Number(req.body.quantity)) ? Number(req.body.quantity) : null,
+                    });
+                }
                 this.stateStore.touchUser(auth.address, { source: "telegram_notify" });
                 trackTradeExecutionCounters({
                     venue: String(req.body?.venue || "frontend").trim() || "frontend",
@@ -2183,6 +2327,45 @@ export class AirificaServer {
                             executionVenue: market.executionVenue,
                             minOrderSize: market.minOrderSize,
                             lotSize: market.lotSize,
+                        },
+                    });
+                    return;
+                }
+
+                if (market.executionVenue === "jupiter" && market.supportedOnJupiter) {
+                    const proposal = this.stateStore.createProposal(link.walletAddress, `tg_${chatId}`, {
+                        symbol,
+                        side,
+                        entry,
+                        tp,
+                        sl,
+                        timeframe: String(rawProposal.timeframe || "1H"),
+                        confidence: Number.isFinite(Number(rawProposal.confidence)) ? Number(rawProposal.confidence) : 0.6,
+                        thesis: String(rawProposal.thesis || "").slice(0, 500),
+                        sourceAction: String(rawProposal.sourceAction || "AIRIFICA_TELEGRAM"),
+                    }, {
+                        marketQuery,
+                        executionVenue: market.executionVenue,
+                        supportedOnPacifica: market.supportedOnPacifica,
+                        supportedOnJupiter: market.supportedOnJupiter,
+                        baseTokenAddress: market.baseTokenAddress,
+                        pairAddress: market.pairAddress,
+                        maxLeverage: 1,
+                    });
+
+                    res.json({
+                        ok: true,
+                        kind: "spot",
+                        proposalId: proposal.id,
+                        availableUsd: summary.availableUsd,
+                        proposal: proposal.proposal,
+                        market: {
+                            symbol: market.symbol,
+                            executionVenue: market.executionVenue,
+                            supportedOnPacifica: market.supportedOnPacifica,
+                            supportedOnJupiter: market.supportedOnJupiter,
+                            baseTokenAddress: market.baseTokenAddress,
+                            requestQuery: market.requestQuery || marketQuery,
                         },
                     });
                     return;

@@ -95,6 +95,19 @@ export interface TelegramNotificationRecord {
     deliveredAt: number | null;
 }
 
+export interface OnchainSpotWatchRecord {
+    walletAddress: string;
+    mintAddress: string;
+    symbol: string | null;
+    marketQuery: string | null;
+    lastTradeAt: number | null;
+    lastTxSignature: string | null;
+    lastNotionalUsd: number | null;
+    lastQuantity: number | null;
+    createdAt: number;
+    updatedAt: number;
+}
+
 interface AirificaStateShape {
     nextProposalId: number;
     nextTelegramNotificationId: number;
@@ -106,6 +119,7 @@ interface AirificaStateShape {
     telegramLinkCodes: Record<string, TelegramLinkCodeRecord>;
     telegramLinks: Record<string, TelegramLinkRecord>;
     telegramNotifications: Record<string, TelegramNotificationRecord>;
+    onchainSpotWatches: Record<string, OnchainSpotWatchRecord>;
 }
 
 const DEFAULT_STATE: AirificaStateShape = {
@@ -119,6 +133,7 @@ const DEFAULT_STATE: AirificaStateShape = {
     telegramLinkCodes: {},
     telegramLinks: {},
     telegramNotifications: {},
+    onchainSpotWatches: {},
 };
 
 function resolveStateFilePath() {
@@ -178,6 +193,9 @@ export class AirificaStateStore {
                     : {},
                 telegramNotifications: parsed.telegramNotifications && typeof parsed.telegramNotifications === 'object'
                     ? parsed.telegramNotifications as Record<string, TelegramNotificationRecord>
+                    : {},
+                onchainSpotWatches: parsed.onchainSpotWatches && typeof parsed.onchainSpotWatches === 'object'
+                    ? parsed.onchainSpotWatches as Record<string, OnchainSpotWatchRecord>
                     : {},
             };
         } catch {
@@ -550,5 +568,48 @@ export class AirificaStateStore {
     listTelegramNotifications() {
         return Object.values(this.state.telegramNotifications)
             .sort((left, right) => right.updatedAt - left.updatedAt);
+    }
+
+    private getOnchainSpotWatchKey(walletAddress: string, mintAddress: string) {
+        return `${walletAddress}:${mintAddress}`;
+    }
+
+    getOnchainSpotWatch(walletAddress: string, mintAddress: string) {
+        return this.state.onchainSpotWatches[this.getOnchainSpotWatchKey(walletAddress, mintAddress)] || null;
+    }
+
+    upsertOnchainSpotWatch(
+        walletAddress: string,
+        mintAddress: string,
+        patch: Omit<OnchainSpotWatchRecord, 'walletAddress' | 'mintAddress' | 'createdAt' | 'updatedAt'>,
+    ) {
+        const key = this.getOnchainSpotWatchKey(walletAddress, mintAddress);
+        const existing = this.state.onchainSpotWatches[key];
+        const now = Date.now();
+        const next: OnchainSpotWatchRecord = {
+            walletAddress,
+            mintAddress,
+            symbol: patch.symbol ?? existing?.symbol ?? null,
+            marketQuery: patch.marketQuery ?? existing?.marketQuery ?? null,
+            lastTradeAt: patch.lastTradeAt ?? existing?.lastTradeAt ?? null,
+            lastTxSignature: patch.lastTxSignature ?? existing?.lastTxSignature ?? null,
+            lastNotionalUsd: patch.lastNotionalUsd ?? existing?.lastNotionalUsd ?? null,
+            lastQuantity: patch.lastQuantity ?? existing?.lastQuantity ?? null,
+            createdAt: existing?.createdAt || now,
+            updatedAt: now,
+        };
+        this.state.onchainSpotWatches[key] = next;
+        this.persist();
+        return next;
+    }
+
+    listOnchainSpotWatches() {
+        return Object.values(this.state.onchainSpotWatches)
+            .sort((left, right) => right.updatedAt - left.updatedAt);
+    }
+
+    listOnchainSpotWatchesForWallet(walletAddress: string) {
+        return this.listOnchainSpotWatches()
+            .filter(record => record.walletAddress === walletAddress);
     }
 }
