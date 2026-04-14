@@ -605,7 +605,7 @@ export class AirificaServer {
     constructor(runtime: IAgentRuntime, port = DEFAULT_PORT) {
         this.port = port;
         this.messageManager = new AirificaMessageManager(runtime);
-        this.stateStore = new AirificaStateStore();
+        this.stateStore = new AirificaStateStore((runtime.databaseAdapter as { db?: unknown })?.db);
         this.app = express();
         this.httpServer = http.createServer(this.app);
         this.wss = new WebSocketServer({ server: this.httpServer, path: "/api/airi3/ws" });
