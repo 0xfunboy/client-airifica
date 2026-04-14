@@ -1034,8 +1034,6 @@ export class AirificaServer {
                 const discoveredBalance = discoveredBalances.find(balance => balance.mintAddress === mintAddress) || null;
                 const balance = discoveredBalance || await readSpotTokenBalance(walletAddress, mintAddress);
                 const quantity = Number(balance?.quantity || 0);
-                if (!Number.isFinite(quantity) || quantity <= 0)
-                    return null;
 
                 let market: Awaited<ReturnType<typeof fetchMarketContext>> | null = null;
                 try {
@@ -1047,26 +1045,39 @@ export class AirificaServer {
                         error,
                     });
                 }
-
-                if (!market)
-                    return null;
-
                 const priceUsd = Number(market?.price);
                 const normalizedPrice = Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
+                const syncedWatch = this.stateStore.syncOnchainSpotHolding(walletAddress, mintAddress, {
+                    symbol: market?.symbol || watch?.symbol || null,
+                    marketQuery: watch?.marketQuery || market?.requestQuery || mintAddress,
+                    quantity,
+                    priceUsd: normalizedPrice,
+                    txSignature: watch?.lastTxSignature || null,
+                });
+
+                if (!Number.isFinite(quantity) || quantity <= 0)
+                    return null;
+
                 const valueUsd = normalizedPrice != null ? normalizedPrice * quantity : null;
+                const costBasisUsd = Number(syncedWatch.costBasisUsd || 0);
+                const unrealizedPnlUsd = valueUsd != null && costBasisUsd > 0 ? valueUsd - costBasisUsd : null;
+                const fallbackSymbol = syncedWatch.symbol || watch?.symbol || `${mintAddress.slice(0, 4)}…${mintAddress.slice(-4)}`;
 
                 return {
-                    symbol: market?.symbol || watch?.symbol || "TOKEN",
+                    symbol: market?.symbol || fallbackSymbol,
                     mintAddress,
                     quantity,
                     decimals: Number(balance?.decimals || 0),
                     priceUsd: normalizedPrice,
                     valueUsd,
+                    costBasisUsd: costBasisUsd > 0 ? costBasisUsd : null,
+                    unrealizedPnlUsd,
+                    realizedPnlUsd: Number.isFinite(Number(syncedWatch.realizedPnlUsd || 0)) ? Number(syncedWatch.realizedPnlUsd || 0) : null,
                     provider: market?.provider || null,
-                    marketQuery: watch?.marketQuery || mintAddress,
-                    lastTradeAt: watch?.lastTradeAt || watch?.updatedAt || Date.now(),
-                    lastTxSignature: watch?.lastTxSignature || null,
-                    updatedAt: watch?.updatedAt || Date.now(),
+                    marketQuery: syncedWatch.marketQuery || watch?.marketQuery || mintAddress,
+                    lastTradeAt: syncedWatch.lastTradeAt || watch?.lastTradeAt || watch?.updatedAt || Date.now(),
+                    lastTxSignature: syncedWatch.lastTxSignature || watch?.lastTxSignature || null,
+                    updatedAt: syncedWatch.updatedAt || watch?.updatedAt || Date.now(),
                 };
             }));
 
@@ -1083,6 +1094,7 @@ export class AirificaServer {
         const closePacificaPositionForWallet = async (
             walletAddress: string,
             input: { symbol: string; side?: "LONG" | "SHORT" | null; amount?: number | null },
+            executionSource: "web" | "telegram" = "web",
         ) => {
             const symbol = normalizeSymbol(input.symbol);
             if (!symbol)
@@ -1109,6 +1121,10 @@ export class AirificaServer {
             const amountToClose = requestedAmount > 0 ? Math.min(requestedAmount, targetPosition.amount) : targetPosition.amount;
             if (!Number.isFinite(amountToClose) || amountToClose <= 0)
                 throw new Error("Invalid close amount");
+            const realizedPnlUsd = targetPosition.markPrice > 0 && targetPosition.entryPrice > 0
+                ? (targetPosition.markPrice - targetPosition.entryPrice) * amountToClose * (targetPosition.side === "SHORT" ? -1 : 1)
+                : 0;
+            const closeNotionalUsd = targetPosition.markPrice > 0 ? targetPosition.markPrice * amountToClose : targetPosition.entryPrice * amountToClose;
 
             const closeSide = targetPosition.side === "LONG" ? "ask" : "bid";
             const orderResult = await createMarketOrderForContext(ctx, {
@@ -1122,8 +1138,28 @@ export class AirificaServer {
                 symbol,
                 side: targetPosition.side,
                 amount: amountToClose,
+                realizedPnlUsd,
+                notionalUsd: closeNotionalUsd,
                 orderId: extractPacificaOrderId(orderResult),
                 pacificaResponse: orderResult,
+                ledger: this.stateStore.appendTradeLedgerRecord({
+                    walletAddress,
+                    venue: "pacifica",
+                    marketType: "perp",
+                    symbol,
+                    side: "CLOSE",
+                    quantity: amountToClose,
+                    notionalUsd: closeNotionalUsd,
+                    marginUsd: null,
+                    leverage: null,
+                    realizedPnlUsd,
+                    mintAddress: null,
+                    orderId: extractPacificaOrderId(orderResult),
+                    txSignature: null,
+                    proposalId: null,
+                    executionSource,
+                    note: `${targetPosition.side} close`,
+                }),
             };
         };
 
@@ -1215,47 +1251,42 @@ export class AirificaServer {
             }
         };
 
-        const buildTelegramWalletSummary = async (walletAddress: string) => {
-            const overview = await buildPacificaOverview(walletAddress);
+        const buildTelegramWalletSummary = async (
+            walletAddress: string,
+            overviewInput?: Awaited<ReturnType<typeof buildPacificaOverview>>,
+        ) => {
+            const overview = overviewInput || await buildPacificaOverview(walletAddress);
             await maybePrimePacificaKnowledge(walletAddress, overview);
             const account = overview.account;
             const positions = Array.isArray(overview.positions) ? overview.positions : [];
             const onchainPositions = Array.isArray((overview as any).onchainPositions) ? (overview as any).onchainPositions : [];
+            const tradeLedger = this.stateStore.listTradeLedgerForWallet(walletAddress);
             const onchainWatchMap = new Map(
                 this.stateStore.listOnchainSpotWatchesForWallet(walletAddress)
                     .map(item => [String(item.mintAddress || "").trim(), item]),
             );
+            const realizedPnlUsd = tradeLedger.reduce((sum, item) => sum + Number(item.realizedPnlUsd || 0), 0);
             const onchainPnlUsd = onchainPositions.reduce((sum: number, position: any) => {
                 const watch = onchainWatchMap.get(String(position.mintAddress || "").trim());
                 if (!watch)
                     return sum;
-                const lastNotionalUsd = Number(watch.lastNotionalUsd || 0);
+                const lastNotionalUsd = Number(watch.costBasisUsd || 0);
                 const currentValueUsd = Number(position.valueUsd || 0);
                 if (!Number.isFinite(lastNotionalUsd) || lastNotionalUsd <= 0 || !Number.isFinite(currentValueUsd))
                     return sum;
                 return sum + (currentValueUsd - lastNotionalUsd);
             }, 0);
-            const totalPnlUsd = positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0) + onchainPnlUsd;
-            const latestTrade = this.stateStore.getLatestExecutedProposalForWallet(walletAddress);
-            const latestOnchainTrade = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress)
-                .sort((left, right) => Number(right.lastTradeAt || right.updatedAt) - Number(left.lastTradeAt || left.updatedAt))[0] || null;
-            const effectiveLatestTrade = latestOnchainTrade && (!latestTrade || Number(latestOnchainTrade.lastTradeAt || 0) >= Number(latestTrade.updatedAt || 0))
+            const totalPnlUsd = realizedPnlUsd + positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0) + onchainPnlUsd;
+            const latestTrade = tradeLedger[0] || null;
+            const effectiveLatestTrade = latestTrade
                 ? {
-                    symbol: latestOnchainTrade.symbol || "TOKEN",
-                    side: "LONG",
-                    orderId: latestOnchainTrade.lastTxSignature,
-                    updatedAt: latestOnchainTrade.lastTradeAt || latestOnchainTrade.updatedAt,
-                    venue: "jupiter",
+                    symbol: latestTrade.symbol,
+                    side: latestTrade.side,
+                    orderId: latestTrade.orderId || latestTrade.txSignature,
+                    updatedAt: latestTrade.updatedAt,
+                    venue: latestTrade.venue,
                 }
-                : latestTrade
-                    ? {
-                        symbol: latestTrade.proposal.symbol,
-                        side: latestTrade.proposal.side,
-                        orderId: latestTrade.orderId,
-                        updatedAt: latestTrade.updatedAt,
-                        venue: latestTrade.executionVenue || "pacifica",
-                    }
-                    : null;
+                : null;
 
             return {
                 walletAddress,
@@ -1265,16 +1296,37 @@ export class AirificaServer {
                 positionsCount: positions.length,
                 onchainPositionsCount: onchainPositions.length,
                 onchainValueUsd: onchainPositions.reduce((sum: number, position: any) => sum + Number(position.valueUsd || 0), 0),
+                realizedPnlUsd,
                 totalPnlUsd,
                 latestTrade: effectiveLatestTrade,
             };
         };
 
-        const buildTelegramTradeHistory = async (walletAddress: string) => {
-            const executed = this.stateStore.listProposals()
-                .filter(proposal => proposal.walletAddress === walletAddress && proposal.status === "EXECUTED")
-                .sort((left, right) => Number(right.executedAt || right.updatedAt) - Number(left.executedAt || left.updatedAt))
-                .slice(0, 12)
+        const buildTelegramTradeHistory = async (
+            walletAddress: string,
+            overviewInput?: Awaited<ReturnType<typeof buildPacificaOverview>>,
+        ) => {
+            const overview = overviewInput || await buildPacificaOverview(walletAddress);
+            const livePerpPnlByKey = new Map(
+                (Array.isArray(overview.positions) ? overview.positions : []).map(position => [
+                    `${String(position.symbol || "").toUpperCase()}:${String(position.side || "").toUpperCase()}`,
+                    Number(position.unrealizedPnlUsd || 0),
+                ]),
+            );
+            const liveSpotPnlByMint = new Map(
+                (Array.isArray((overview as any).onchainPositions) ? (overview as any).onchainPositions : []).map((position: any) => [
+                    String(position.mintAddress || "").trim(),
+                    position.unrealizedPnlUsd == null ? null : Number(position.unrealizedPnlUsd || 0),
+                ]),
+            );
+            const ledger = this.stateStore.listTradeLedgerForWallet(walletAddress);
+            const seenProposalIds = new Set(
+                ledger
+                    .map(item => Number(item.proposalId || 0))
+                    .filter(value => Number.isFinite(value) && value > 0),
+            );
+            const legacyExecuted = this.stateStore.listProposals()
+                .filter(proposal => proposal.walletAddress === walletAddress && proposal.status === "EXECUTED" && !seenProposalIds.has(proposal.id))
                 .map((proposal) => ({
                     id: proposal.id,
                     symbol: proposal.proposal.symbol,
@@ -1284,10 +1336,31 @@ export class AirificaServer {
                     notionalUsd: Number(proposal.executedNotionalUsd || 0),
                     marginUsd: Number(proposal.executedMarginUsd || 0),
                     leverage: Number(proposal.executedLeverage || 1),
+                    realizedPnlUsd: null,
+                    currentPnlUsd: livePerpPnlByKey.get(`${String(proposal.proposal.symbol || "").toUpperCase()}:${String(proposal.proposal.side || "").toUpperCase()}`) ?? null,
                     updatedAt: Number(proposal.executedAt || proposal.updatedAt || Date.now()),
                 }));
 
-            return executed;
+            return [
+                ...ledger.map(item => ({
+                    id: item.id,
+                    symbol: item.symbol,
+                    side: item.side,
+                    venue: item.venue,
+                    orderId: item.orderId || item.txSignature,
+                    notionalUsd: Number(item.notionalUsd || 0),
+                    marginUsd: Number(item.marginUsd || 0),
+                    leverage: Number(item.leverage || 1),
+                    realizedPnlUsd: item.realizedPnlUsd == null ? null : Number(item.realizedPnlUsd),
+                    currentPnlUsd: item.marketType === "perp"
+                        ? livePerpPnlByKey.get(`${String(item.symbol || "").toUpperCase()}:${String(item.side || "").toUpperCase()}`) ?? null
+                        : (item.mintAddress ? liveSpotPnlByMint.get(String(item.mintAddress || "").trim()) ?? null : null),
+                    updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
+                })),
+                ...legacyExecuted,
+            ]
+                .sort((left, right) => right.updatedAt - left.updatedAt)
+                .slice(0, 20);
         };
 
         const STOPWORD_TICKERS = new Set([
@@ -1677,6 +1750,24 @@ export class AirificaServer {
                     executedAt: Date.now(),
                     executionSource,
                 });
+                this.stateStore.appendTradeLedgerRecord({
+                    walletAddress,
+                    venue: "pacifica",
+                    marketType: "perp",
+                    symbol: proposal.proposal.symbol,
+                    side: proposal.proposal.side,
+                    quantity: size,
+                    notionalUsd: requestedNotional,
+                    marginUsd,
+                    leverage,
+                    realizedPnlUsd: null,
+                    mintAddress: null,
+                    orderId,
+                    txSignature: null,
+                    proposalId,
+                    executionSource,
+                    note: "Pacifica open",
+                });
                 trackTradeExecutionCounters({
                     venue: "pacifica",
                     symbol: proposal.proposal.symbol,
@@ -2025,6 +2116,33 @@ export class AirificaServer {
                         });
                     }
                 }
+                const existingSpotWatch = outputMint
+                    ? this.stateStore.getOnchainSpotWatch(auth.address, outputMint)
+                    : null;
+                const nextSpotQuantity = Number.isFinite(quantity) && quantity > 0
+                    ? Math.max(0, Number(existingSpotWatch?.lastQuantity || 0) + quantity)
+                    : Number(existingSpotWatch?.lastQuantity || 0);
+                const nextSpotCostBasisUsd = Number.isFinite(amountUsd) && amountUsd > 0
+                    ? Math.max(0, Number(existingSpotWatch?.costBasisUsd || 0) + amountUsd)
+                    : Number(existingSpotWatch?.costBasisUsd || 0);
+                this.stateStore.appendTradeLedgerRecord({
+                    walletAddress: auth.address,
+                    venue: "jupiter",
+                    marketType: "spot",
+                    symbol,
+                    side: String(req.body?.side || "").trim().toUpperCase() === "SELL" ? "SELL" : "BUY",
+                    quantity: Number.isFinite(quantity) ? quantity : null,
+                    notionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
+                    marginUsd: null,
+                    leverage: 1,
+                    realizedPnlUsd: null,
+                    mintAddress: outputMint || null,
+                    orderId: null,
+                    txSignature,
+                    proposalId: Number.isFinite(proposalId) && proposalId > 0 ? proposalId : null,
+                    executionSource: "web",
+                    note: "Jupiter spot execution",
+                });
 
                 const text = buildTelegramTradeAlertText({
                     venue,
@@ -2052,7 +2170,9 @@ export class AirificaServer {
                         lastTradeAt: Date.now(),
                         lastTxSignature: txSignature,
                         lastNotionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
-                        lastQuantity: Number.isFinite(quantity) ? quantity : null,
+                        lastQuantity: Number.isFinite(nextSpotQuantity) ? nextSpotQuantity : null,
+                        costBasisUsd: Number.isFinite(nextSpotCostBasisUsd) ? nextSpotCostBasisUsd : null,
+                        realizedPnlUsd: Number(existingSpotWatch?.realizedPnlUsd || 0),
                     });
                 }
                 this.stateStore.touchUser(auth.address, { source: "telegram_notify" });
@@ -2338,8 +2458,10 @@ export class AirificaServer {
                     return;
                 }
 
-                const history = await buildTelegramTradeHistory(link.walletAddress);
-                const summary = await buildTelegramWalletSummary(link.walletAddress);
+                const overview = await buildPacificaOverview(link.walletAddress);
+                await maybePrimePacificaKnowledge(link.walletAddress, overview);
+                const history = await buildTelegramTradeHistory(link.walletAddress, overview);
+                const summary = await buildTelegramWalletSummary(link.walletAddress, overview);
                 res.json({
                     ok: true,
                     walletAddress: link.walletAddress,
@@ -2368,7 +2490,7 @@ export class AirificaServer {
                     symbol: String(req.body?.symbol || ""),
                     side: req.body?.side ? normalizePacificaSide(req.body.side, null) : null,
                     amount: req.body?.amount != null ? Number(req.body.amount) : null,
-                });
+                }, "telegram");
                 queueTelegramTradeAlert(
                     link.walletAddress,
                     `Closed ${result.side} ${result.symbol} position (${result.amount}).`,
@@ -2946,7 +3068,7 @@ export class AirificaServer {
                     symbol: String(req.body?.symbol || ""),
                     side: req.body?.side ? normalizePacificaSide(req.body.side, null) : null,
                     amount: req.body?.amount != null ? Number(req.body.amount) : null,
-                });
+                }, "web");
                 queueTelegramTradeAlert(
                     auth.address,
                     `Closed ${result.side} ${result.symbol} position from Airifica frontend (${result.amount}).`,

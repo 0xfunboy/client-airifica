@@ -105,6 +105,30 @@ export interface OnchainSpotWatchRecord {
     lastTxSignature: string | null;
     lastNotionalUsd: number | null;
     lastQuantity: number | null;
+    costBasisUsd: number | null;
+    realizedPnlUsd: number | null;
+    createdAt: number;
+    updatedAt: number;
+}
+
+export interface TradeLedgerRecord {
+    id: number;
+    walletAddress: string;
+    venue: "pacifica" | "jupiter";
+    marketType: "perp" | "spot";
+    symbol: string;
+    side: "LONG" | "SHORT" | "BUY" | "SELL" | "CLOSE";
+    quantity: number | null;
+    notionalUsd: number | null;
+    marginUsd: number | null;
+    leverage: number | null;
+    realizedPnlUsd: number | null;
+    mintAddress: string | null;
+    orderId: string | null;
+    txSignature: string | null;
+    proposalId: number | null;
+    executionSource: string | null;
+    note: string | null;
     createdAt: number;
     updatedAt: number;
 }
@@ -112,6 +136,7 @@ export interface OnchainSpotWatchRecord {
 interface AirificaStateShape {
     nextProposalId: number;
     nextTelegramNotificationId: number;
+    nextTradeLedgerId: number;
     pacificaBindings: Record<string, PacificaBindingRecord>;
     proposals: Record<string, TradeProposalRecord>;
     users: Record<string, AirificaUserRecord>;
@@ -121,11 +146,13 @@ interface AirificaStateShape {
     telegramLinks: Record<string, TelegramLinkRecord>;
     telegramNotifications: Record<string, TelegramNotificationRecord>;
     onchainSpotWatches: Record<string, OnchainSpotWatchRecord>;
+    tradeLedger: Record<string, TradeLedgerRecord>;
 }
 
 const DEFAULT_STATE: AirificaStateShape = {
     nextProposalId: 1,
     nextTelegramNotificationId: 1,
+    nextTradeLedgerId: 1,
     pacificaBindings: {},
     proposals: {},
     users: {},
@@ -135,6 +162,7 @@ const DEFAULT_STATE: AirificaStateShape = {
     telegramLinks: {},
     telegramNotifications: {},
     onchainSpotWatches: {},
+    tradeLedger: {},
 };
 
 function resolveStateFilePath() {
@@ -171,6 +199,7 @@ export class AirificaStateStore {
             this.state = {
                 nextProposalId: Number(parsed.nextProposalId || DEFAULT_STATE.nextProposalId),
                 nextTelegramNotificationId: Number(parsed.nextTelegramNotificationId || DEFAULT_STATE.nextTelegramNotificationId),
+                nextTradeLedgerId: Number(parsed.nextTradeLedgerId || DEFAULT_STATE.nextTradeLedgerId),
                 pacificaBindings: parsed.pacificaBindings && typeof parsed.pacificaBindings === 'object'
                     ? parsed.pacificaBindings as Record<string, PacificaBindingRecord>
                     : {},
@@ -197,6 +226,9 @@ export class AirificaStateStore {
                     : {},
                 onchainSpotWatches: parsed.onchainSpotWatches && typeof parsed.onchainSpotWatches === 'object'
                     ? parsed.onchainSpotWatches as Record<string, OnchainSpotWatchRecord>
+                    : {},
+                tradeLedger: parsed.tradeLedger && typeof parsed.tradeLedger === 'object'
+                    ? parsed.tradeLedger as Record<string, TradeLedgerRecord>
                     : {},
             };
         } catch {
@@ -598,6 +630,8 @@ export class AirificaStateStore {
             lastTxSignature: patch.lastTxSignature ?? existing?.lastTxSignature ?? null,
             lastNotionalUsd: patch.lastNotionalUsd ?? existing?.lastNotionalUsd ?? null,
             lastQuantity: patch.lastQuantity ?? existing?.lastQuantity ?? null,
+            costBasisUsd: patch.costBasisUsd ?? existing?.costBasisUsd ?? null,
+            realizedPnlUsd: patch.realizedPnlUsd ?? existing?.realizedPnlUsd ?? null,
             createdAt: existing?.createdAt || now,
             updatedAt: now,
         };
@@ -614,5 +648,95 @@ export class AirificaStateStore {
     listOnchainSpotWatchesForWallet(walletAddress: string) {
         return this.listOnchainSpotWatches()
             .filter(record => record.walletAddress === walletAddress);
+    }
+
+    syncOnchainSpotHolding(
+        walletAddress: string,
+        mintAddress: string,
+        patch: {
+            symbol?: string | null;
+            marketQuery?: string | null;
+            quantity: number;
+            priceUsd?: number | null;
+            txSignature?: string | null;
+            note?: string | null;
+        },
+    ) {
+        const existing = this.getOnchainSpotWatch(walletAddress, mintAddress);
+        const nextQuantity = Math.max(0, Number(patch.quantity || 0));
+        const currentQuantity = Math.max(0, Number(existing?.lastQuantity || 0));
+        const priceUsd = Number(patch.priceUsd);
+        const hasPrice = Number.isFinite(priceUsd) && priceUsd >= 0;
+        const currentCostBasisUsd = Math.max(0, Number(existing?.costBasisUsd || 0));
+        const currentRealizedPnlUsd = Number(existing?.realizedPnlUsd || 0);
+        let nextCostBasisUsd = currentCostBasisUsd;
+        let nextRealizedPnlUsd = currentRealizedPnlUsd;
+
+        if (currentQuantity > 0 && nextQuantity < currentQuantity) {
+            const soldQuantity = currentQuantity - nextQuantity;
+            const averageCostUsd = currentCostBasisUsd > 0 ? currentCostBasisUsd / currentQuantity : 0;
+            const removedCostBasisUsd = averageCostUsd * soldQuantity;
+            nextCostBasisUsd = Math.max(0, currentCostBasisUsd - removedCostBasisUsd);
+            if (hasPrice)
+                nextRealizedPnlUsd += (priceUsd * soldQuantity) - removedCostBasisUsd;
+        } else if (nextQuantity > currentQuantity) {
+            const boughtQuantity = nextQuantity - currentQuantity;
+            if (hasPrice)
+                nextCostBasisUsd += priceUsd * boughtQuantity;
+        } else if (nextQuantity === 0) {
+            nextCostBasisUsd = 0;
+        }
+
+        const nextSymbol = patch.symbol ?? existing?.symbol ?? null;
+        const nextMarketQuery = patch.marketQuery ?? existing?.marketQuery ?? null;
+        const nextTxSignature = patch.txSignature ?? existing?.lastTxSignature ?? null;
+        const materiallyChanged =
+            !existing
+            || nextQuantity !== currentQuantity
+            || nextSymbol !== (existing?.symbol ?? null)
+            || nextMarketQuery !== (existing?.marketQuery ?? null)
+            || nextTxSignature !== (existing?.lastTxSignature ?? null)
+            || Math.abs(nextCostBasisUsd - currentCostBasisUsd) > 0.000001
+            || Math.abs(nextRealizedPnlUsd - currentRealizedPnlUsd) > 0.000001;
+
+        if (!materiallyChanged && existing)
+            return existing;
+
+        const next = this.upsertOnchainSpotWatch(walletAddress, mintAddress, {
+            symbol: nextSymbol,
+            marketQuery: nextMarketQuery,
+            lastTradeAt: nextQuantity !== currentQuantity || nextTxSignature !== (existing?.lastTxSignature ?? null)
+                ? Date.now()
+                : existing?.lastTradeAt ?? null,
+            lastTxSignature: nextTxSignature,
+            lastNotionalUsd: hasPrice ? priceUsd * nextQuantity : existing?.lastNotionalUsd ?? null,
+            lastQuantity: nextQuantity,
+            costBasisUsd: nextCostBasisUsd,
+            realizedPnlUsd: nextRealizedPnlUsd,
+        });
+
+        return next;
+    }
+
+    appendTradeLedgerRecord(
+        payload: Omit<TradeLedgerRecord, "id" | "createdAt" | "updatedAt">,
+    ) {
+        const id = this.state.nextTradeLedgerId++;
+        const now = Date.now();
+        const record: TradeLedgerRecord = {
+            id,
+            ...payload,
+            createdAt: now,
+            updatedAt: now,
+        };
+        this.state.tradeLedger[String(id)] = record;
+        this.persist();
+        return record;
+    }
+
+    listTradeLedgerForWallet(walletAddress: string) {
+        return Object.values(this.state.tradeLedger)
+            .filter(record => record.walletAddress === walletAddress)
+            .sort((left, right) => right.createdAt - left.createdAt);
     }
 }
