@@ -815,6 +815,7 @@ export class AirificaServer {
             const side = normalizePacificaSide(payload.side || "", null) || String(payload.side || "").trim().toUpperCase() || "TRADE";
             const amountUsd = Number(payload.amountUsd);
             const quantity = Number(payload.quantity);
+            const isJupiter = /jupiter/i.test(venue);
             const lines = [
                 `Opened ${side} ${symbol}${venue ? ` via ${venue}` : ""}.`,
             ];
@@ -826,6 +827,9 @@ export class AirificaServer {
                 facts.push(`Size: ${quantity.toFixed(6)}`);
             if (facts.length)
                 lines.push(facts.join(" · "));
+
+            if (isJupiter)
+                lines.push("TP/SL levels remain analytical only for spot swaps.");
 
             if (payload.explorerUrl) {
                 lines.push(payload.explorerUrl);
@@ -1123,9 +1127,14 @@ export class AirificaServer {
             };
         };
 
-        const queueTelegramTradeAlert = (walletAddress: string, text: string, kind: "TRADE_OPENED" | "POSITION_CLOSED") => {
+        const queueTelegramTradeAlert = (
+            walletAddress: string,
+            text: string,
+            kind: "TRADE_OPENED" | "POSITION_CLOSED",
+            meta?: Record<string, unknown> | null,
+        ) => {
             try {
-                this.stateStore.createTelegramNotifications(walletAddress, kind, text);
+                this.stateStore.createTelegramNotifications(walletAddress, kind, text, meta);
             } catch (error) {
                 elizaLogger.warn("[client-airifica] telegram alert queue skipped:", error);
             }
@@ -1958,33 +1967,63 @@ export class AirificaServer {
                     return;
                 }
 
-                const text = buildTelegramTradeAlertText({
-                    venue: String(req.body?.venue || "frontend").trim() || "frontend",
-                    symbol,
-                    side: req.body?.side ? String(req.body.side) : null,
-                    amountUsd: req.body?.amountUsd != null ? Number(req.body.amountUsd) : null,
-                    quantity: req.body?.quantity != null ? Number(req.body.quantity) : null,
-                    txSignature: req.body?.txSignature ? String(req.body.txSignature) : null,
-                    explorerUrl: req.body?.explorerUrl ? String(req.body.explorerUrl) : null,
-                });
-
-                const notifications = this.stateStore.createTelegramNotifications(auth.address, "TRADE_OPENED", text);
+                const proposalId = Number(req.body?.proposalId);
                 const amountUsd = Number(req.body?.amountUsd);
+                const quantity = Number(req.body?.quantity);
+                const venue = String(req.body?.venue || "frontend").trim() || "frontend";
+                const txSignature = req.body?.txSignature ? String(req.body.txSignature) : null;
+                const explorerUrl = req.body?.explorerUrl ? String(req.body.explorerUrl) : null;
                 const outputMint = String(req.body?.outputMint || "").trim();
                 const marketQuery = normalizeMarketContextQuery(req.body?.marketQuery || outputMint || symbol) || symbol;
-                if (outputMint && String(req.body?.venue || "").trim().toLowerCase().includes("jupiter")) {
+
+                if (Number.isFinite(proposalId) && proposalId > 0) {
+                    const storedProposal = this.stateStore.getProposal(proposalId);
+                    if (storedProposal && storedProposal.walletAddress === auth.address) {
+                        this.stateStore.updateProposal(proposalId, {
+                            status: "EXECUTED",
+                            orderId: txSignature,
+                            errorMessage: null,
+                            executedMarginUsd: Number.isFinite(amountUsd) ? amountUsd : null,
+                            executedLeverage: 1,
+                            executedNotionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
+                            executedAt: Date.now(),
+                            executionSource: "web",
+                        });
+                    }
+                }
+
+                const text = buildTelegramTradeAlertText({
+                    venue,
+                    symbol,
+                    side: req.body?.side ? String(req.body.side) : null,
+                    amountUsd: Number.isFinite(amountUsd) ? amountUsd : null,
+                    quantity: Number.isFinite(quantity) ? quantity : null,
+                    txSignature,
+                    explorerUrl,
+                });
+
+                const notifications = this.stateStore.createTelegramNotifications(auth.address, "TRADE_OPENED", text, {
+                    proposalId: Number.isFinite(proposalId) && proposalId > 0 ? proposalId : null,
+                    symbol,
+                    venue,
+                    txSignature,
+                    explorerUrl,
+                    outputMint: outputMint || null,
+                    marketQuery,
+                });
+                if (outputMint && venue.toLowerCase().includes("jupiter")) {
                     this.stateStore.upsertOnchainSpotWatch(auth.address, outputMint, {
                         symbol,
                         marketQuery,
                         lastTradeAt: Date.now(),
-                        lastTxSignature: req.body?.txSignature ? String(req.body.txSignature) : null,
+                        lastTxSignature: txSignature,
                         lastNotionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
-                        lastQuantity: req.body?.quantity != null && Number.isFinite(Number(req.body.quantity)) ? Number(req.body.quantity) : null,
+                        lastQuantity: Number.isFinite(quantity) ? quantity : null,
                     });
                 }
                 this.stateStore.touchUser(auth.address, { source: "telegram_notify" });
                 trackTradeExecutionCounters({
-                    venue: String(req.body?.venue || "frontend").trim() || "frontend",
+                    venue,
                     symbol,
                     notionalUsd: Number.isFinite(amountUsd) ? amountUsd : 0,
                     source: "web",

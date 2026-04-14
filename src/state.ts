@@ -88,6 +88,7 @@ export interface TelegramNotificationRecord {
     chatId: string;
     kind: 'TRADE_OPENED' | 'POSITION_CLOSED';
     text: string;
+    meta?: Record<string, unknown> | null;
     status: 'PENDING' | 'DELIVERED' | 'FAILED';
     errorMessage: string | null;
     createdAt: number;
@@ -507,6 +508,7 @@ export class AirificaStateStore {
         walletAddress: string,
         kind: TelegramNotificationRecord['kind'],
         text: string,
+        meta?: Record<string, unknown> | null,
     ) {
         const recipients = this.listTelegramLinksForWallet(walletAddress)
             .filter(link => link.alertsEnabled);
@@ -522,6 +524,7 @@ export class AirificaStateStore {
                 chatId: link.chatId,
                 kind,
                 text,
+                meta: meta && typeof meta === 'object' ? meta : null,
                 status: 'PENDING',
                 errorMessage: null,
                 createdAt: now,
