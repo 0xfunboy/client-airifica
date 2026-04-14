@@ -68,12 +68,19 @@ const AIRIFICA_TELEGRAM_BOT_USERNAME = String(
     || "",
 ).trim().replace(/^@/, "");
 const AIRIFICA_TELEGRAM_LINK_CODE_TTL_MS = Math.max(60_000, Number(envValue("TELEGRAM_LINK_CODE_TTL_MS", "600000")));
+const AIRIFICA_TELEGRAM_HEARTBEAT_STALE_MS = Math.max(30_000, Number(envValue("TELEGRAM_HEARTBEAT_STALE_MS", "120000")));
 const AIRIFICA_TELEGRAM_INTERNAL_SECRET = String(
     envValue("TELEGRAM_INTERNAL_SECRET")
     || envValue("TELEGRAM_BOT_TOKEN")
     || "",
 ).trim();
 const AIRIFICA_TELEGRAM_NOTIFY_BASE_URL = AIRIFICA_PUBLIC_APP_URL || null;
+const AIRIFICA_ADMIN_WALLETS = new Set(
+    envValue("ADMIN_WALLETS")
+        .split(/[,\s]+/)
+        .map(value => value.trim())
+        .filter(Boolean),
+);
 
 const parseOriginList = (value: string) =>
     value
@@ -103,6 +110,10 @@ function applySecurityHeaders(res: Response) {
 
 function compact(text: string) {
     return text.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function isAdminWallet(address: string) {
+    return AIRIFICA_ADMIN_WALLETS.has(String(address || "").trim());
 }
 
 function assertSecurityConfiguration() {
@@ -209,6 +220,13 @@ function formatUsdCompact(value: number) {
     if (!Number.isFinite(numeric))
         return "0.00";
     return numeric.toFixed(Math.abs(numeric) >= 100 ? 2 : 4);
+}
+
+function shortWallet(value: unknown) {
+    const text = String(value ?? "").trim();
+    if (text.length <= 14)
+        return text;
+    return `${text.slice(0, 6)}…${text.slice(-6)}`;
 }
 
 function pickBracketPrice(
@@ -588,12 +606,19 @@ export class AirificaServer {
                     return;
                 }
 
+                const admin = isAdminWallet(address);
+                this.stateStore.touchUser(address, {
+                    verified: true,
+                    isAdmin: admin,
+                    source: "wallet_auth",
+                });
+
                 res.json({
-                    token: signAuthToken(address, false),
+                    token: signAuthToken(address, admin),
                     user: {
                         id: 0,
                         address,
-                        isAdmin: false,
+                        isAdmin: admin,
                     },
                 });
             } catch (err: any) {
@@ -610,7 +635,11 @@ export class AirificaServer {
                     res.status(401).json({ error: "Missing token" });
                     return null;
                 }
-                return verifyAuthToken(token);
+                const payload = verifyAuthToken(token);
+                return {
+                    ...payload,
+                    isAdmin: payload.isAdmin || isAdminWallet(payload.address),
+                };
             } catch {
                 res.status(401).json({ error: "Unauthorized" });
                 return null;
@@ -623,10 +652,25 @@ export class AirificaServer {
                 const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
                 if (!token)
                     return null;
-                return verifyAuthToken(token);
+                const payload = verifyAuthToken(token);
+                return {
+                    ...payload,
+                    isAdmin: payload.isAdmin || isAdminWallet(payload.address),
+                };
             } catch {
                 return null;
             }
+        };
+
+        const requireAdmin = (req: Request, res: Response) => {
+            const auth = requireAuth(req, res);
+            if (!auth)
+                return null;
+            if (!auth.isAdmin) {
+                res.status(403).json({ ok: false, error: "Admin access required" });
+                return null;
+            }
+            return auth;
         };
 
         const requireTelegramInternal = (req: Request, res: Response) => {
@@ -1016,6 +1060,277 @@ export class AirificaServer {
             };
         };
 
+        const STOPWORD_TICKERS = new Set([
+            "HOW",
+            "ARE",
+            "YOU",
+            "WHAT",
+            "SHOW",
+            "ME",
+            "THE",
+            "FOR",
+            "AND",
+            "WITH",
+            "FROM",
+            "THIS",
+            "THAT",
+            "PLEASE",
+            "PRICE",
+            "CHART",
+            "ANALYSIS",
+            "FUNDAMENTALS",
+            "FUNDAMENTAL",
+            "NEWS",
+            "SENTIMENT",
+            "VOLUME",
+            "LISTINGS",
+            "TRENDING",
+            "TOKEN",
+            "TOKENS",
+            "MENTIONED",
+            "BOOSTED",
+            "OPEN",
+            "POSITION",
+            "POSITIONS",
+            "CLOSE",
+            "LONG",
+            "SHORT",
+            "ACCOUNT",
+            "EQUITY",
+            "AVAILABLE",
+            "WITHDRAWABLE",
+        ]);
+
+        const extractIdentifiersFromText = (text: string) => {
+            const raw = String(text || "").trim();
+            const contractAddresses = Array.from(new Set(
+                Array.from(raw.matchAll(/\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{25,60})\b/g))
+                    .map(match => normalizeMarketContextQuery(match[1]))
+                    .filter(Boolean),
+            ));
+
+            const explicitTickers = new Set<string>();
+            for (const match of raw.matchAll(/\$([a-zA-Z0-9]{2,12})\b/g)) {
+                const normalized = normalizeMarketContextQuery(match[1]);
+                if (normalized)
+                    explicitTickers.add(normalized);
+            }
+
+            for (const match of raw.matchAll(/\b(?:price|chart|analysis|fundamentals|fundamental|news|sentiment|for|of|about|on)\s+\$?([a-zA-Z0-9]{2,12})\b/gi)) {
+                const normalized = normalizeMarketContextQuery(match[1]);
+                if (normalized && !STOPWORD_TICKERS.has(normalized))
+                    explicitTickers.add(normalized);
+            }
+
+            if (!contractAddresses.length) {
+                const tokens = raw.match(/\b[a-zA-Z]{2,12}\b/g) || [];
+                if (tokens.length === 1) {
+                    const normalized = normalizeMarketContextQuery(tokens[0]);
+                    if (normalized && !STOPWORD_TICKERS.has(normalized))
+                        explicitTickers.add(normalized);
+                }
+            }
+
+            return {
+                contractAddresses,
+                tickers: Array.from(explicitTickers),
+            };
+        };
+
+        const trackPromptAnalytics = (walletAddress: string, source: string, text: string) => {
+            this.stateStore.touchUser(walletAddress, { source });
+            this.stateStore.incrementCounter("request_source", source);
+
+            const identifiers = extractIdentifiersFromText(text);
+            identifiers.tickers.forEach((ticker) => {
+                this.stateStore.incrementCounter("requested_ticker", ticker);
+            });
+            identifiers.contractAddresses.forEach((address) => {
+                this.stateStore.incrementCounter("requested_contract", address);
+            });
+        };
+
+        const trackTradeExecutionCounters = (payload: {
+            venue: string;
+            symbol: string;
+            notionalUsd: number;
+            source: string;
+        }) => {
+            this.stateStore.incrementCounter("trade_count", payload.venue);
+            this.stateStore.incrementCounter("trade_source", payload.source);
+            this.stateStore.incrementCounter("trade_symbol", payload.symbol);
+            if (Number.isFinite(payload.notionalUsd) && payload.notionalUsd > 0)
+                this.stateStore.incrementCounter("trade_volume_usd", payload.venue, payload.notionalUsd);
+        };
+
+        const topCounters = (prefix: string, limit = 8) =>
+            this.stateStore.listCounters(prefix)
+                .slice(0, limit)
+                .map((counter) => ({
+                    key: counter.key.slice(prefix.length + 1),
+                    count: counter.count,
+                    updatedAt: counter.updatedAt,
+                }));
+
+        const buildAdminOverview = async () => {
+            const users = this.stateStore.listUsers();
+            const bindings = this.stateStore.listBindings();
+            const proposals = this.stateStore.listProposals();
+            const telegramLinks = this.stateStore.listTelegramLinks();
+            const notifications = this.stateStore.listTelegramNotifications();
+            const telegramHeartbeat = this.stateStore.getRuntimeHeartbeat("telegram");
+            let marketUniverseCount = 0;
+
+            try {
+                marketUniverseCount = (await fetchPacificaMarketUniverse()).length;
+            } catch {
+            }
+
+            const executedProposals = proposals.filter(proposal => proposal.status === "EXECUTED");
+            const proposalStatusCounts = proposals.reduce<Record<string, number>>((acc, proposal) => {
+                acc[proposal.status] = Number(acc[proposal.status] || 0) + 1;
+                return acc;
+            }, {});
+            const telegramStatus = {
+                configured: Boolean(AIRIFICA_TELEGRAM_BOT_USERNAME && AIRIFICA_TELEGRAM_INTERNAL_SECRET),
+                botUsername: AIRIFICA_TELEGRAM_BOT_USERNAME || null,
+                linkedChats: telegramLinks.length,
+                linkedWallets: new Set(telegramLinks.map(link => link.walletAddress)).size,
+                alertsEnabledChats: telegramLinks.filter(link => link.alertsEnabled).length,
+                conversationEnabledChats: telegramLinks.filter(link => link.conversationalEnabled).length,
+                pendingLinkCodes: this.stateStore.countPendingTelegramLinkCodes(),
+                deliveredAlerts: notifications.filter(notification => notification.status === "DELIVERED").length,
+                failedAlerts: notifications.filter(notification => notification.status === "FAILED").length,
+                pendingAlerts: notifications.filter(notification => notification.status === "PENDING").length,
+                heartbeat: telegramHeartbeat
+                    ? {
+                        live: Date.now() - telegramHeartbeat.lastSeenAt <= AIRIFICA_TELEGRAM_HEARTBEAT_STALE_MS,
+                        lastSeenAt: telegramHeartbeat.lastSeenAt,
+                        meta: telegramHeartbeat.meta,
+                    }
+                    : {
+                        live: false,
+                        lastSeenAt: null,
+                        meta: {},
+                    },
+            };
+
+            const pacificaVolumeUsd = this.stateStore.listCounters("trade_volume_usd")
+                .filter(counter => counter.key === "trade_volume_usd:pacifica")
+                .reduce((sum, counter) => sum + Number(counter.count || 0), 0);
+            const jupiterVolumeUsd = this.stateStore.listCounters("trade_volume_usd")
+                .filter(counter => counter.key !== "trade_volume_usd:pacifica")
+                .reduce((sum, counter) => sum + Number(counter.count || 0), 0);
+
+            const recentTrades = executedProposals
+                .slice(0, 10)
+                .map((proposal) => ({
+                    id: proposal.id,
+                    walletAddress: proposal.walletAddress,
+                    symbol: proposal.proposal.symbol,
+                    side: proposal.proposal.side,
+                    venue: proposal.executionVenue || "pacifica",
+                    source: proposal.executionSource || "web",
+                    orderId: proposal.orderId,
+                    notionalUsd: proposal.executedNotionalUsd || 0,
+                    marginUsd: proposal.executedMarginUsd || 0,
+                    leverage: proposal.executedLeverage || 1,
+                    updatedAt: proposal.updatedAt,
+                }));
+
+            const recentUsers = users.slice(0, 12).map((user) => {
+                const binding = this.stateStore.getBinding(user.walletAddress);
+                const linkedChats = this.stateStore.listTelegramLinksForWallet(user.walletAddress).length;
+                const latestTrade = this.stateStore.getLatestExecutedProposalForWallet(user.walletAddress);
+
+                return {
+                    walletAddress: user.walletAddress,
+                    firstSeenAt: user.firstSeenAt,
+                    lastSeenAt: user.lastSeenAt,
+                    verifiedAt: user.verifiedAt,
+                    authCount: user.authCount,
+                    isAdmin: user.isAdmin,
+                    lastSource: user.lastSource,
+                    linkedChats,
+                    binding: binding
+                        ? {
+                            isActive: binding.isActive,
+                            builderApprovedAt: binding.builderApprovedAt,
+                            agentBoundAt: binding.agentBoundAt,
+                            pacificaAccount: binding.pacificaAccount,
+                        }
+                        : null,
+                    latestTrade: latestTrade
+                        ? {
+                            symbol: latestTrade.proposal.symbol,
+                            side: latestTrade.proposal.side,
+                            updatedAt: latestTrade.updatedAt,
+                        }
+                        : null,
+                };
+            });
+
+            return {
+                ok: true,
+                generatedAt: Date.now(),
+                overview: {
+                    totalKnownWallets: users.length,
+                    verifiedWallets: users.filter(user => Boolean(user.verifiedAt)).length,
+                    adminWalletsSeen: users.filter(user => user.isAdmin).length,
+                    adminWalletsConfigured: AIRIFICA_ADMIN_WALLETS.size,
+                    pacificaBindings: bindings.length,
+                    pacificaBuildersApproved: bindings.filter(binding => Boolean(binding.builderApprovedAt)).length,
+                    pacificaActiveAgents: bindings.filter(binding => Boolean(binding.isActive && binding.builderApprovedAt && binding.agentBoundAt)).length,
+                    totalProposals: proposals.length,
+                    executedTrades: executedProposals.length,
+                    pacificaExecutedVolumeUsd: pacificaVolumeUsd,
+                    externalReportedVolumeUsd: jupiterVolumeUsd,
+                    marketUniverseCount,
+                },
+                users: {
+                    recent: recentUsers,
+                },
+                trading: {
+                    proposalStatusCounts,
+                    recentTrades,
+                    topRequestedTickers: topCounters("requested_ticker"),
+                    topRequestedContracts: topCounters("requested_contract"),
+                    topTradeSymbols: topCounters("trade_symbol"),
+                },
+                telegram: {
+                    ...telegramStatus,
+                    topCommands: topCounters("telegram_command"),
+                    topActions: topCounters("telegram_action"),
+                },
+                runtime: {
+                    service: "client-airifica",
+                    nodeEnv: NODE_ENV,
+                    port: this.port,
+                    pid: process.pid,
+                    uptimeSec: Math.round(process.uptime()),
+                    memory: {
+                        rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+                        heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+                        heapTotalMb: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+                    },
+                    config: {
+                        publicAppUrl: AIRIFICA_PUBLIC_APP_URL || null,
+                        corsOriginsConfigured: configuredCorsOrigins.size,
+                        pacificaApiBase: PACIFICA_API_BASE,
+                        pacificaPublicApiBase: PACIFICA_PUBLIC_API_BASE,
+                        pacificaBuilderCode: PACIFICA_BUILDER_CODE || null,
+                        pacificaBuilderMaxFeeRate: PACIFICA_BUILDER_MAX_FEE_RATE || null,
+                        encryptionKeyConfigured: Boolean(AIRIFICA_ENCRYPTION_KEY),
+                        authSecretConfigured: Boolean(envValue("AUTH_SECRET").trim()),
+                        telegramBotUsername: AIRIFICA_TELEGRAM_BOT_USERNAME || null,
+                        telegramInternalConfigured: Boolean(AIRIFICA_TELEGRAM_INTERNAL_SECRET),
+                        telegramNotifyBaseUrl: AIRIFICA_TELEGRAM_NOTIFY_BASE_URL,
+                        adminWallets: Array.from(AIRIFICA_ADMIN_WALLETS).map(shortWallet),
+                    },
+                },
+            };
+        };
+
         const extractMarketQueryFromText = (text: string, fallbackSymbol?: string | null) => {
             const raw = String(text || "").trim();
             const addressMatch = raw.match(/\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{25,60})\b/);
@@ -1046,6 +1361,7 @@ export class AirificaServer {
             proposalId: number,
             requestedMarginUsd: number,
             requestedLeverage: number,
+            executionSource: "web" | "telegram" = "web",
         ) => {
             const proposal = this.stateStore.getProposal(proposalId);
             if (!proposal)
@@ -1125,6 +1441,17 @@ export class AirificaServer {
                     status: "EXECUTED",
                     orderId,
                     errorMessage: null,
+                    executedMarginUsd: marginUsd,
+                    executedLeverage: leverage,
+                    executedNotionalUsd: requestedNotional,
+                    executedAt: Date.now(),
+                    executionSource,
+                });
+                trackTradeExecutionCounters({
+                    venue: "pacifica",
+                    symbol: proposal.proposal.symbol,
+                    notionalUsd: requestedNotional,
+                    source: executionSource,
                 });
                 queueTelegramTradeAlert(
                     walletAddress,
@@ -1196,6 +1523,7 @@ export class AirificaServer {
                     res.status(400).json({ ok: false, error: "invalid walletAddress or session identity" });
                     return;
                 }
+                this.stateStore.touchUser(body.walletAddress, { source: "session" });
                 const conversationId = body.conversationId ||
                     `conv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
                 const userId = this.messageManager.getUserId(body.walletAddress);
@@ -1226,6 +1554,7 @@ export class AirificaServer {
                     return;
                 }
                 const auth = maybeAuth(req);
+                trackPromptAnalytics(body.walletAddress, auth && auth.address === body.walletAddress ? "web_authed" : "web_guest", body.text);
                 const pacificaKnowledge = auth && auth.address === body.walletAddress
                     ? getPacificaKnowledgeSnapshot(auth.address)
                     : null;
@@ -1307,12 +1636,33 @@ export class AirificaServer {
             });
         });
 
+        this.app.get("/api/airi3/admin/overview", async (req: Request, res: Response) => {
+            const auth = requireAdmin(req, res);
+            if (!auth)
+                return;
+
+            try {
+                this.stateStore.touchUser(auth.address, {
+                    source: "admin_dashboard",
+                    isAdmin: true,
+                });
+                res.json(await buildAdminOverview());
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/admin/overview error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
         this.app.post("/api/airi3/telegram/link/request", async (req: Request, res: Response) => {
             const auth = requireAuth(req, res);
             if (!auth)
                 return;
 
             try {
+                this.stateStore.touchUser(auth.address, {
+                    source: "telegram_link_request",
+                    isAdmin: auth.isAdmin,
+                });
                 const linkCode = this.stateStore.createTelegramLinkCode(auth.address, AIRIFICA_TELEGRAM_LINK_CODE_TTL_MS);
                 res.json({
                     ok: true,
@@ -1333,6 +1683,10 @@ export class AirificaServer {
                 return;
 
             try {
+                this.stateStore.touchUser(auth.address, {
+                    source: "telegram_link_status",
+                    isAdmin: auth.isAdmin,
+                });
                 res.json({
                     ok: true,
                     botUsername: AIRIFICA_TELEGRAM_BOT_USERNAME || null,
@@ -1428,6 +1782,14 @@ export class AirificaServer {
                 });
 
                 const notifications = this.stateStore.createTelegramNotifications(auth.address, "TRADE_OPENED", text);
+                const amountUsd = Number(req.body?.amountUsd);
+                this.stateStore.touchUser(auth.address, { source: "telegram_notify" });
+                trackTradeExecutionCounters({
+                    venue: String(req.body?.venue || "frontend").trim() || "frontend",
+                    symbol,
+                    notionalUsd: Number.isFinite(amountUsd) ? amountUsd : 0,
+                    source: "web",
+                });
                 res.json({
                     ok: true,
                     queued: notifications.length,
@@ -1465,6 +1827,8 @@ export class AirificaServer {
                     return;
                 }
 
+                this.stateStore.touchUser(link.walletAddress, { source: "telegram_link" });
+                this.stateStore.incrementCounter("telegram_link", "linked");
                 void maybePrimePacificaKnowledge(link.walletAddress);
                 res.json({
                     ok: true,
@@ -1513,6 +1877,52 @@ export class AirificaServer {
                 res.json({ ok: true, link, summary });
             } catch (err: any) {
                 elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/link/status error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/internal/runtime/heartbeat", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const meta = req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {};
+                this.stateStore.updateRuntimeHeartbeat("telegram", meta);
+                res.json({ ok: true });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/runtime/heartbeat error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/internal/analytics/event", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                const category = String(req.body?.category || "").trim().toLowerCase();
+                const key = String(req.body?.key || "").trim();
+                if (!category || !key) {
+                    res.status(400).json({ ok: false, error: "category and key required" });
+                    return;
+                }
+
+                if (!["telegram_command", "telegram_action", "telegram_action_prompt"].includes(category)) {
+                    res.status(400).json({ ok: false, error: "unsupported analytics category" });
+                    return;
+                }
+
+                if (chatId) {
+                    const link = this.stateStore.getTelegramLink(chatId);
+                    if (link)
+                        this.stateStore.touchUser(link.walletAddress, { source: "telegram_event" });
+                }
+
+                this.stateStore.incrementCounter(category, key);
+                res.json({ ok: true });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/analytics/event error:", err);
                 res.status(500).json({ ok: false, error: err?.message || "server error" });
             }
         });
@@ -1695,6 +2105,7 @@ export class AirificaServer {
                     return;
                 }
 
+                trackPromptAnalytics(link.walletAddress, "telegram", text);
                 const pacificaKnowledge = getPacificaKnowledgeSnapshot(link.walletAddress);
                 const responses = await this.messageManager.handleMessage({
                     walletAddress: link.walletAddress,
@@ -1893,7 +2304,7 @@ export class AirificaServer {
                     return;
                 }
 
-                const result = await executeStoredProposal(link.walletAddress, proposalId, marginUsd, leverage);
+                const result = await executeStoredProposal(link.walletAddress, proposalId, marginUsd, leverage, "telegram");
                 res.json({
                     ok: true,
                     orderId: result.orderId,
@@ -1920,6 +2331,11 @@ export class AirificaServer {
                 const timeframe = typeof rawTf === "string" ? rawTf.toLowerCase() : "1h";
                 const rawLimit = Number(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit);
                 const limit = Number.isFinite(rawLimit) ? rawLimit : 96;
+                if (/^(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{25,60})$/.test(String(rawSymbol || "").trim()))
+                    this.stateStore.incrementCounter("requested_contract", String(rawSymbol).trim());
+                else
+                    this.stateStore.incrementCounter("requested_ticker", symbol);
+                this.stateStore.incrementCounter("request_source", "market_context");
 
                 const payload = await fetchMarketContext(symbol, timeframe, limit);
                 res.json(payload);
@@ -1980,6 +2396,7 @@ export class AirificaServer {
                     thesis: thesis ? String(thesis).slice(0, 500) : null,
                     sourceAction: source_client || "AIRIFICA_STAGE_WEB",
                 });
+                this.stateStore.touchUser(auth.address, { source: "proposal_create", isAdmin: auth.isAdmin });
 
                 res.json({ ok: true, proposal: { id: proposal.id } });
             } catch (err: any) {
@@ -2001,7 +2418,7 @@ export class AirificaServer {
                 }
                 const requestedMarginUsd = Number(req.body?.notional_usd || AIRIFICA_DEFAULT_NOTIONAL_USD);
                 const requestedLeverage = Number(req.body?.leverage || 1);
-                const result = await executeStoredProposal(auth.address, proposalId, requestedMarginUsd, requestedLeverage);
+                const result = await executeStoredProposal(auth.address, proposalId, requestedMarginUsd, requestedLeverage, "web");
                 res.json({ ok: true, orderId: result.orderId, pacificaResponse: result.pacificaResponse });
             } catch (err: any) {
                 if (err?.payload && err?.statusCode) {

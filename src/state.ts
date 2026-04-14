@@ -32,8 +32,35 @@ export interface TradeProposalRecord {
     status: 'PROPOSED' | 'APPROVED' | 'EXECUTED' | 'FAILED' | 'REJECTED';
     errorMessage: string | null;
     orderId: string | null;
+    executedMarginUsd?: number | null;
+    executedLeverage?: number | null;
+    executedNotionalUsd?: number | null;
+    executedAt?: number | null;
+    executionSource?: string | null;
     createdAt: number;
     updatedAt: number;
+}
+
+export interface AirificaUserRecord {
+    walletAddress: string;
+    firstSeenAt: number;
+    lastSeenAt: number;
+    verifiedAt: number | null;
+    authCount: number;
+    isAdmin: boolean;
+    lastSource: string | null;
+}
+
+export interface AnalyticsCounterRecord {
+    key: string;
+    count: number;
+    updatedAt: number;
+}
+
+export interface RuntimeHeartbeatRecord {
+    name: string;
+    lastSeenAt: number;
+    meta: Record<string, unknown>;
 }
 
 export interface TelegramLinkCodeRecord {
@@ -73,6 +100,9 @@ interface AirificaStateShape {
     nextTelegramNotificationId: number;
     pacificaBindings: Record<string, PacificaBindingRecord>;
     proposals: Record<string, TradeProposalRecord>;
+    users: Record<string, AirificaUserRecord>;
+    analyticsCounters: Record<string, AnalyticsCounterRecord>;
+    runtimeHeartbeats: Record<string, RuntimeHeartbeatRecord>;
     telegramLinkCodes: Record<string, TelegramLinkCodeRecord>;
     telegramLinks: Record<string, TelegramLinkRecord>;
     telegramNotifications: Record<string, TelegramNotificationRecord>;
@@ -83,6 +113,9 @@ const DEFAULT_STATE: AirificaStateShape = {
     nextTelegramNotificationId: 1,
     pacificaBindings: {},
     proposals: {},
+    users: {},
+    analyticsCounters: {},
+    runtimeHeartbeats: {},
     telegramLinkCodes: {},
     telegramLinks: {},
     telegramNotifications: {},
@@ -128,6 +161,15 @@ export class AirificaStateStore {
                 proposals: parsed.proposals && typeof parsed.proposals === 'object'
                     ? parsed.proposals as Record<string, TradeProposalRecord>
                     : {},
+                users: parsed.users && typeof parsed.users === 'object'
+                    ? parsed.users as Record<string, AirificaUserRecord>
+                    : {},
+                analyticsCounters: parsed.analyticsCounters && typeof parsed.analyticsCounters === 'object'
+                    ? parsed.analyticsCounters as Record<string, AnalyticsCounterRecord>
+                    : {},
+                runtimeHeartbeats: parsed.runtimeHeartbeats && typeof parsed.runtimeHeartbeats === 'object'
+                    ? parsed.runtimeHeartbeats as Record<string, RuntimeHeartbeatRecord>
+                    : {},
                 telegramLinkCodes: parsed.telegramLinkCodes && typeof parsed.telegramLinkCodes === 'object'
                     ? parsed.telegramLinkCodes as Record<string, TelegramLinkCodeRecord>
                     : {},
@@ -153,6 +195,11 @@ export class AirificaStateStore {
 
     getBinding(walletAddress: string) {
         return this.state.pacificaBindings[walletAddress] || null;
+    }
+
+    listBindings() {
+        return Object.values(this.state.pacificaBindings)
+            .sort((left, right) => right.updatedAt - left.updatedAt);
     }
 
     upsertBinding(walletAddress: string, patch: Omit<PacificaBindingRecord, 'walletAddress' | 'createdAt' | 'updatedAt'>) {
@@ -223,6 +270,11 @@ export class AirificaStateStore {
         return this.state.proposals[String(id)] || null;
     }
 
+    listProposals() {
+        return Object.values(this.state.proposals)
+            .sort((left, right) => right.updatedAt - left.updatedAt);
+    }
+
     updateProposal(id: number, patch: Partial<TradeProposalRecord>) {
         const existing = this.getProposal(id);
         if (!existing)
@@ -242,6 +294,92 @@ export class AirificaStateStore {
         return Object.values(this.state.proposals)
             .filter(proposal => proposal.walletAddress === walletAddress && proposal.status === "EXECUTED")
             .sort((left, right) => right.updatedAt - left.updatedAt)[0] || null;
+    }
+
+    touchUser(
+        walletAddress: string,
+        options?: {
+            verified?: boolean;
+            isAdmin?: boolean;
+            source?: string | null;
+        },
+    ) {
+        const now = Date.now();
+        const existing = this.state.users[walletAddress];
+        const next: AirificaUserRecord = {
+            walletAddress,
+            firstSeenAt: existing?.firstSeenAt || now,
+            lastSeenAt: now,
+            verifiedAt: options?.verified
+                ? (existing?.verifiedAt || now)
+                : (existing?.verifiedAt || null),
+            authCount: options?.verified
+                ? Number(existing?.authCount || 0) + 1
+                : Number(existing?.authCount || 0),
+            isAdmin: typeof options?.isAdmin === 'boolean' ? options.isAdmin : Boolean(existing?.isAdmin),
+            lastSource: options?.source?.trim() || existing?.lastSource || null,
+        };
+        this.state.users[walletAddress] = next;
+        this.persist();
+        return next;
+    }
+
+    getUser(walletAddress: string) {
+        return this.state.users[walletAddress] || null;
+    }
+
+    listUsers() {
+        return Object.values(this.state.users)
+            .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
+    }
+
+    incrementCounter(prefix: string, key: string, amount = 1) {
+        const normalizedPrefix = String(prefix || '').trim().toLowerCase();
+        const normalizedKey = String(key || '').trim();
+        if (!normalizedPrefix || !normalizedKey)
+            return null;
+
+        const compositeKey = `${normalizedPrefix}:${normalizedKey}`;
+        const existing = this.state.analyticsCounters[compositeKey];
+        const next: AnalyticsCounterRecord = {
+            key: compositeKey,
+            count: Number(existing?.count || 0) + amount,
+            updatedAt: Date.now(),
+        };
+        this.state.analyticsCounters[compositeKey] = next;
+        this.persist();
+        return next;
+    }
+
+    listCounters(prefix?: string) {
+        const normalizedPrefix = prefix?.trim().toLowerCase();
+        return Object.values(this.state.analyticsCounters)
+            .filter((counter) => normalizedPrefix ? counter.key.startsWith(`${normalizedPrefix}:`) : true)
+            .sort((left, right) => right.count - left.count || right.updatedAt - left.updatedAt);
+    }
+
+    updateRuntimeHeartbeat(name: string, meta?: Record<string, unknown>) {
+        const normalizedName = String(name || '').trim().toLowerCase();
+        if (!normalizedName)
+            return null;
+
+        const next: RuntimeHeartbeatRecord = {
+            name: normalizedName,
+            lastSeenAt: Date.now(),
+            meta: meta && typeof meta === 'object' ? meta : {},
+        };
+        this.state.runtimeHeartbeats[normalizedName] = next;
+        this.persist();
+        return next;
+    }
+
+    getRuntimeHeartbeat(name: string) {
+        return this.state.runtimeHeartbeats[String(name || '').trim().toLowerCase()] || null;
+    }
+
+    listRuntimeHeartbeats() {
+        return Object.values(this.state.runtimeHeartbeats)
+            .sort((left, right) => right.lastSeenAt - left.lastSeenAt);
     }
 
     pruneExpiredTelegramLinkCodes(now = Date.now()) {
@@ -307,6 +445,11 @@ export class AirificaStateStore {
         return this.state.telegramLinks[chatId] || null;
     }
 
+    listTelegramLinks() {
+        return Object.values(this.state.telegramLinks)
+            .sort((left, right) => right.updatedAt - left.updatedAt);
+    }
+
     listTelegramLinksForWallet(walletAddress: string) {
         return Object.values(this.state.telegramLinks)
             .filter(link => link.walletAddress === walletAddress)
@@ -335,6 +478,11 @@ export class AirificaStateStore {
         delete this.state.telegramLinks[chatId];
         this.persist();
         return true;
+    }
+
+    countPendingTelegramLinkCodes(now = Date.now()) {
+        this.pruneExpiredTelegramLinkCodes(now);
+        return Object.keys(this.state.telegramLinkCodes).length;
     }
 
     createTelegramNotifications(
@@ -397,5 +545,10 @@ export class AirificaStateStore {
         existing.updatedAt = Date.now();
         this.persist();
         return existing;
+    }
+
+    listTelegramNotifications() {
+        return Object.values(this.state.telegramNotifications)
+            .sort((left, right) => right.updatedAt - left.updatedAt);
     }
 }
