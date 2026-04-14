@@ -84,6 +84,11 @@ const AIRIFICA_ADMIN_WALLETS = new Set(
         .filter(Boolean),
 );
 const solanaConnection = SOLANA_RPC_URL ? new Connection(SOLANA_RPC_URL, "confirmed") : null;
+const SOLANA_TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ONCHAIN_SPOT_EXCLUDED_MINTS = new Set([
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCER4W9xJfYbVNewc19hXtF87mpy4VbQ5KMc",
+]);
 
 const parseOriginList = (value: string) =>
     value
@@ -473,6 +478,44 @@ async function readSpotTokenBalance(walletAddress: string, mintAddress: string) 
             error,
         });
         return null;
+    }
+}
+
+async function discoverWalletTokenBalances(walletAddress: string) {
+    if (!solanaConnection || !isValidSolanaAddress(walletAddress))
+        return [];
+
+    try {
+        const owner = new PublicKey(walletAddress);
+        const accounts = await solanaConnection.getParsedTokenAccountsByOwner(owner, { programId: SOLANA_TOKEN_PROGRAM_ID });
+        const balances = new Map<string, { mintAddress: string; quantity: number; decimals: number }>();
+
+        for (const account of accounts.value) {
+            const parsedInfo = (account.account.data as any)?.parsed?.info;
+            const mintAddress = String(parsedInfo?.mint || "").trim();
+            if (!mintAddress || ONCHAIN_SPOT_EXCLUDED_MINTS.has(mintAddress))
+                continue;
+            const tokenAmount = parsedInfo?.tokenAmount;
+            const quantity = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0);
+            if (!Number.isFinite(quantity) || quantity <= 0)
+                continue;
+            const decimals = Number(tokenAmount?.decimals);
+            const existing = balances.get(mintAddress);
+            balances.set(mintAddress, {
+                mintAddress,
+                quantity: Number(existing?.quantity || 0) + quantity,
+                decimals: Number.isFinite(decimals) ? decimals : Number(existing?.decimals || 0),
+            });
+        }
+
+        return Array.from(balances.values())
+            .sort((left, right) => right.quantity - left.quantity);
+    } catch (error) {
+        elizaLogger.warn("[client-airifica] wallet token discovery failed:", {
+            walletAddress,
+            error,
+        });
+        return [];
     }
 }
 
@@ -969,45 +1012,57 @@ export class AirificaServer {
 
         const buildOnchainSpotPositions = async (walletAddress: string) => {
             const watches = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
-            if (!watches.length)
+            const discoveredBalances = await discoverWalletTokenBalances(walletAddress);
+            if (!watches.length && !discoveredBalances.length)
                 return [];
 
-            const positions = await Promise.all(watches.map(async (watch) => {
-                if (!watch.mintAddress)
+            const watchByMint = new Map(watches.map(watch => [watch.mintAddress, watch]));
+            const candidateMints = new Set<string>([
+                ...watches.map(watch => watch.mintAddress),
+                ...discoveredBalances.map(balance => balance.mintAddress),
+            ]);
+
+            const positions = await Promise.all(Array.from(candidateMints).map(async (mintAddress) => {
+                if (!mintAddress)
                     return null;
 
-                const balance = await readSpotTokenBalance(walletAddress, watch.mintAddress);
+                const watch = watchByMint.get(mintAddress) || null;
+                const discoveredBalance = discoveredBalances.find(balance => balance.mintAddress === mintAddress) || null;
+                const balance = discoveredBalance || await readSpotTokenBalance(walletAddress, mintAddress);
                 const quantity = Number(balance?.quantity || 0);
                 if (!Number.isFinite(quantity) || quantity <= 0)
                     return null;
 
                 let market: Awaited<ReturnType<typeof fetchMarketContext>> | null = null;
                 try {
-                    market = await fetchMarketContext(watch.marketQuery || watch.mintAddress, "15m", 96);
+                    market = await fetchMarketContext(watch?.marketQuery || mintAddress, "15m", 96);
                 } catch (error) {
                     elizaLogger.warn("[client-airifica] onchain market context lookup skipped:", {
                         walletAddress,
-                        mintAddress: watch.mintAddress,
+                        mintAddress,
                         error,
                     });
                 }
+
+                if (!market)
+                    return null;
 
                 const priceUsd = Number(market?.price);
                 const normalizedPrice = Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
                 const valueUsd = normalizedPrice != null ? normalizedPrice * quantity : null;
 
                 return {
-                    symbol: market?.symbol || watch.symbol || "TOKEN",
-                    mintAddress: watch.mintAddress,
+                    symbol: market?.symbol || watch?.symbol || "TOKEN",
+                    mintAddress,
                     quantity,
                     decimals: Number(balance?.decimals || 0),
                     priceUsd: normalizedPrice,
                     valueUsd,
                     provider: market?.provider || null,
-                    marketQuery: watch.marketQuery || watch.mintAddress,
-                    lastTradeAt: watch.lastTradeAt || watch.updatedAt,
-                    lastTxSignature: watch.lastTxSignature,
-                    updatedAt: watch.updatedAt,
+                    marketQuery: watch?.marketQuery || mintAddress,
+                    lastTradeAt: watch?.lastTradeAt || watch?.updatedAt || Date.now(),
+                    lastTxSignature: watch?.lastTxSignature || null,
+                    updatedAt: watch?.updatedAt || Date.now(),
                 };
             }));
 
