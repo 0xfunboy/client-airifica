@@ -101,12 +101,25 @@ export interface OnchainSpotWatchRecord {
     mintAddress: string;
     symbol: string | null;
     marketQuery: string | null;
+    decimals: number | null;
+    lastPriceUsd: number | null;
+    lastValueUsd: number | null;
+    lastSyncedAt: number | null;
     lastTradeAt: number | null;
     lastTxSignature: string | null;
     lastNotionalUsd: number | null;
     lastQuantity: number | null;
     costBasisUsd: number | null;
     realizedPnlUsd: number | null;
+    createdAt: number;
+    updatedAt: number;
+}
+
+export interface OnchainWalletSyncRecord {
+    walletAddress: string;
+    lastSyncedAt: number | null;
+    itemCount: number;
+    source: string | null;
     createdAt: number;
     updatedAt: number;
 }
@@ -146,6 +159,7 @@ interface AirificaStateShape {
     telegramLinks: Record<string, TelegramLinkRecord>;
     telegramNotifications: Record<string, TelegramNotificationRecord>;
     onchainSpotWatches: Record<string, OnchainSpotWatchRecord>;
+    onchainWalletSyncs: Record<string, OnchainWalletSyncRecord>;
     tradeLedger: Record<string, TradeLedgerRecord>;
 }
 
@@ -162,6 +176,7 @@ const DEFAULT_STATE: AirificaStateShape = {
     telegramLinks: {},
     telegramNotifications: {},
     onchainSpotWatches: {},
+    onchainWalletSyncs: {},
     tradeLedger: {},
 };
 
@@ -226,6 +241,9 @@ export class AirificaStateStore {
                     : {},
                 onchainSpotWatches: parsed.onchainSpotWatches && typeof parsed.onchainSpotWatches === 'object'
                     ? parsed.onchainSpotWatches as Record<string, OnchainSpotWatchRecord>
+                    : {},
+                onchainWalletSyncs: parsed.onchainWalletSyncs && typeof parsed.onchainWalletSyncs === 'object'
+                    ? parsed.onchainWalletSyncs as Record<string, OnchainWalletSyncRecord>
                     : {},
                 tradeLedger: parsed.tradeLedger && typeof parsed.tradeLedger === 'object'
                     ? parsed.tradeLedger as Record<string, TradeLedgerRecord>
@@ -613,10 +631,14 @@ export class AirificaStateStore {
         return this.state.onchainSpotWatches[this.getOnchainSpotWatchKey(walletAddress, mintAddress)] || null;
     }
 
+    getOnchainWalletSync(walletAddress: string) {
+        return this.state.onchainWalletSyncs[walletAddress] || null;
+    }
+
     upsertOnchainSpotWatch(
         walletAddress: string,
         mintAddress: string,
-        patch: Omit<OnchainSpotWatchRecord, 'walletAddress' | 'mintAddress' | 'createdAt' | 'updatedAt'>,
+        patch: Partial<Omit<OnchainSpotWatchRecord, 'walletAddress' | 'mintAddress' | 'createdAt' | 'updatedAt'>>,
     ) {
         const key = this.getOnchainSpotWatchKey(walletAddress, mintAddress);
         const existing = this.state.onchainSpotWatches[key];
@@ -626,6 +648,10 @@ export class AirificaStateStore {
             mintAddress,
             symbol: patch.symbol ?? existing?.symbol ?? null,
             marketQuery: patch.marketQuery ?? existing?.marketQuery ?? null,
+            decimals: patch.decimals ?? existing?.decimals ?? null,
+            lastPriceUsd: patch.lastPriceUsd ?? existing?.lastPriceUsd ?? null,
+            lastValueUsd: patch.lastValueUsd ?? existing?.lastValueUsd ?? null,
+            lastSyncedAt: patch.lastSyncedAt ?? existing?.lastSyncedAt ?? null,
             lastTradeAt: patch.lastTradeAt ?? existing?.lastTradeAt ?? null,
             lastTxSignature: patch.lastTxSignature ?? existing?.lastTxSignature ?? null,
             lastNotionalUsd: patch.lastNotionalUsd ?? existing?.lastNotionalUsd ?? null,
@@ -650,6 +676,29 @@ export class AirificaStateStore {
             .filter(record => record.walletAddress === walletAddress);
     }
 
+    markOnchainWalletSnapshotSynced(
+        walletAddress: string,
+        patch: {
+            lastSyncedAt: number;
+            itemCount: number;
+            source?: string | null;
+        },
+    ) {
+        const existing = this.state.onchainWalletSyncs[walletAddress];
+        const now = Date.now();
+        const next: OnchainWalletSyncRecord = {
+            walletAddress,
+            lastSyncedAt: patch.lastSyncedAt,
+            itemCount: Math.max(0, Number(patch.itemCount || 0)),
+            source: patch.source ?? existing?.source ?? null,
+            createdAt: existing?.createdAt || now,
+            updatedAt: now,
+        };
+        this.state.onchainWalletSyncs[walletAddress] = next;
+        this.persist();
+        return next;
+    }
+
     syncOnchainSpotHolding(
         walletAddress: string,
         mintAddress: string,
@@ -657,8 +706,11 @@ export class AirificaStateStore {
             symbol?: string | null;
             marketQuery?: string | null;
             quantity: number;
+            decimals?: number | null;
             priceUsd?: number | null;
+            valueUsd?: number | null;
             txSignature?: string | null;
+            lastSyncedAt?: number | null;
             note?: string | null;
         },
     ) {
@@ -667,6 +719,8 @@ export class AirificaStateStore {
         const currentQuantity = Math.max(0, Number(existing?.lastQuantity || 0));
         const priceUsd = Number(patch.priceUsd);
         const hasPrice = Number.isFinite(priceUsd) && priceUsd >= 0;
+        const valueUsd = Number(patch.valueUsd);
+        const hasValue = Number.isFinite(valueUsd) && valueUsd >= 0;
         const currentCostBasisUsd = Math.max(0, Number(existing?.costBasisUsd || 0));
         const currentRealizedPnlUsd = Number(existing?.realizedPnlUsd || 0);
         let nextCostBasisUsd = currentCostBasisUsd;
@@ -688,14 +742,24 @@ export class AirificaStateStore {
         }
 
         const nextSymbol = patch.symbol ?? existing?.symbol ?? null;
+        const nextDecimals = Number.isFinite(Number(patch.decimals)) ? Number(patch.decimals) : existing?.decimals ?? null;
         const nextMarketQuery = patch.marketQuery ?? existing?.marketQuery ?? null;
         const nextTxSignature = patch.txSignature ?? existing?.lastTxSignature ?? null;
+        const nextPriceUsd = hasPrice ? priceUsd : existing?.lastPriceUsd ?? null;
+        const nextValueUsd = hasValue
+            ? valueUsd
+            : (Number.isFinite(Number(nextPriceUsd)) && nextQuantity > 0 ? Number(nextPriceUsd) * nextQuantity : existing?.lastValueUsd ?? null);
+        const nextLastSyncedAt = patch.lastSyncedAt ?? existing?.lastSyncedAt ?? null;
         const materiallyChanged =
             !existing
             || nextQuantity !== currentQuantity
             || nextSymbol !== (existing?.symbol ?? null)
+            || nextDecimals !== (existing?.decimals ?? null)
             || nextMarketQuery !== (existing?.marketQuery ?? null)
             || nextTxSignature !== (existing?.lastTxSignature ?? null)
+            || nextLastSyncedAt !== (existing?.lastSyncedAt ?? null)
+            || Math.abs(Number(nextPriceUsd || 0) - Number(existing?.lastPriceUsd || 0)) > 0.000000001
+            || Math.abs(Number(nextValueUsd || 0) - Number(existing?.lastValueUsd || 0)) > 0.000001
             || Math.abs(nextCostBasisUsd - currentCostBasisUsd) > 0.000001
             || Math.abs(nextRealizedPnlUsd - currentRealizedPnlUsd) > 0.000001;
 
@@ -705,11 +769,15 @@ export class AirificaStateStore {
         const next = this.upsertOnchainSpotWatch(walletAddress, mintAddress, {
             symbol: nextSymbol,
             marketQuery: nextMarketQuery,
+            decimals: nextDecimals,
+            lastPriceUsd: Number.isFinite(Number(nextPriceUsd)) ? Number(nextPriceUsd) : null,
+            lastValueUsd: Number.isFinite(Number(nextValueUsd)) ? Number(nextValueUsd) : null,
+            lastSyncedAt: nextLastSyncedAt,
             lastTradeAt: nextQuantity !== currentQuantity || nextTxSignature !== (existing?.lastTxSignature ?? null)
                 ? Date.now()
                 : existing?.lastTradeAt ?? null,
             lastTxSignature: nextTxSignature,
-            lastNotionalUsd: hasPrice ? priceUsd * nextQuantity : existing?.lastNotionalUsd ?? null,
+            lastNotionalUsd: Number.isFinite(Number(nextValueUsd)) ? Number(nextValueUsd) : (hasPrice ? priceUsd * nextQuantity : existing?.lastNotionalUsd ?? null),
             lastQuantity: nextQuantity,
             costBasisUsd: nextCostBasisUsd,
             realizedPnlUsd: nextRealizedPnlUsd,

@@ -77,6 +77,11 @@ const AIRIFICA_TELEGRAM_INTERNAL_SECRET = String(
 ).trim();
 const AIRIFICA_TELEGRAM_NOTIFY_BASE_URL = AIRIFICA_PUBLIC_APP_URL || null;
 const SOLANA_RPC_URL = (envValue("SOLANA_RPC_URL", process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com")).trim();
+const AIRIFICA_ONCHAIN_PORTFOLIO_SYNC_MS = Math.max(60_000, Number(envValue("ONCHAIN_PORTFOLIO_SYNC_MS", "300000")));
+const AIRIFICA_ONCHAIN_PORTFOLIO_IDLE_MS = Math.max(
+    AIRIFICA_ONCHAIN_PORTFOLIO_SYNC_MS,
+    Number(envValue("ONCHAIN_PORTFOLIO_IDLE_MS", "900000")),
+);
 const AIRIFICA_ADMIN_WALLETS = new Set(
     envValue("ADMIN_WALLETS")
         .split(/[,\s]+/)
@@ -228,6 +233,31 @@ function formatUsdCompact(value: number) {
     if (!Number.isFinite(numeric))
         return "0.00";
     return numeric.toFixed(Math.abs(numeric) >= 100 ? 2 : 4);
+}
+
+function formatAssetQuantity(value: number) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric))
+        return "0";
+
+    const absolute = Math.abs(numeric);
+    if (absolute >= 1_000_000) {
+        return new Intl.NumberFormat("en-US", {
+            notation: "compact",
+            maximumFractionDigits: 3,
+        }).format(numeric);
+    }
+
+    if (absolute >= 1)
+        return numeric.toLocaleString("en-US", { maximumFractionDigits: 4 });
+    if (absolute === 0)
+        return "0";
+
+    const maximumFractionDigits = Math.min(6, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 2));
+    return numeric.toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits,
+    });
 }
 
 function shortWallet(value: unknown) {
@@ -445,78 +475,34 @@ function extractPacificaOrderId(result: unknown) {
     return String(candidate);
 }
 
-async function readSpotTokenBalance(walletAddress: string, mintAddress: string) {
-    if (!solanaConnection || !isValidSolanaAddress(walletAddress) || !isValidSolanaAddress(mintAddress))
-        return null;
-
-    try {
-        const owner = new PublicKey(walletAddress);
-        const mint = new PublicKey(mintAddress);
-        const accounts = await solanaConnection.getParsedTokenAccountsByOwner(owner, { mint });
-        let quantity = 0;
-        let decimals = 0;
-
-        for (const account of accounts.value) {
-            const tokenAmount = (account.account.data as any)?.parsed?.info?.tokenAmount;
-            const uiAmountString = tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? "0";
-            const numeric = Number(uiAmountString);
-            if (Number.isFinite(numeric))
-                quantity += numeric;
-            const parsedDecimals = Number(tokenAmount?.decimals);
-            if (Number.isFinite(parsedDecimals))
-                decimals = parsedDecimals;
-        }
-
-        return {
-            quantity,
-            decimals,
-        };
-    } catch (error) {
-        elizaLogger.warn("[client-airifica] onchain token balance lookup failed:", {
-            walletAddress,
-            mintAddress,
-            error,
-        });
-        return null;
-    }
-}
-
 async function discoverWalletTokenBalances(walletAddress: string) {
     if (!solanaConnection || !isValidSolanaAddress(walletAddress))
         return [];
 
-    try {
-        const owner = new PublicKey(walletAddress);
-        const accounts = await solanaConnection.getParsedTokenAccountsByOwner(owner, { programId: SOLANA_TOKEN_PROGRAM_ID });
-        const balances = new Map<string, { mintAddress: string; quantity: number; decimals: number }>();
+    const owner = new PublicKey(walletAddress);
+    const accounts = await solanaConnection.getParsedTokenAccountsByOwner(owner, { programId: SOLANA_TOKEN_PROGRAM_ID });
+    const balances = new Map<string, { mintAddress: string; quantity: number; decimals: number }>();
 
-        for (const account of accounts.value) {
-            const parsedInfo = (account.account.data as any)?.parsed?.info;
-            const mintAddress = String(parsedInfo?.mint || "").trim();
-            if (!mintAddress || ONCHAIN_SPOT_EXCLUDED_MINTS.has(mintAddress))
-                continue;
-            const tokenAmount = parsedInfo?.tokenAmount;
-            const quantity = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0);
-            if (!Number.isFinite(quantity) || quantity <= 0)
-                continue;
-            const decimals = Number(tokenAmount?.decimals);
-            const existing = balances.get(mintAddress);
-            balances.set(mintAddress, {
-                mintAddress,
-                quantity: Number(existing?.quantity || 0) + quantity,
-                decimals: Number.isFinite(decimals) ? decimals : Number(existing?.decimals || 0),
-            });
-        }
-
-        return Array.from(balances.values())
-            .sort((left, right) => right.quantity - left.quantity);
-    } catch (error) {
-        elizaLogger.warn("[client-airifica] wallet token discovery failed:", {
-            walletAddress,
-            error,
+    for (const account of accounts.value) {
+        const parsedInfo = (account.account.data as any)?.parsed?.info;
+        const mintAddress = String(parsedInfo?.mint || "").trim();
+        if (!mintAddress || ONCHAIN_SPOT_EXCLUDED_MINTS.has(mintAddress))
+            continue;
+        const tokenAmount = parsedInfo?.tokenAmount;
+        const quantity = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0);
+        if (!Number.isFinite(quantity) || quantity <= 0)
+            continue;
+        const decimals = Number(tokenAmount?.decimals);
+        const existing = balances.get(mintAddress);
+        balances.set(mintAddress, {
+            mintAddress,
+            quantity: Number(existing?.quantity || 0) + quantity,
+            decimals: Number.isFinite(decimals) ? decimals : Number(existing?.decimals || 0),
         });
-        return [];
     }
+
+    return Array.from(balances.values())
+        .sort((left, right) => right.quantity - left.quantity);
 }
 
 function sanitizePacificaKnowledgePayload(overview: {
@@ -527,8 +513,11 @@ function sanitizePacificaKnowledgePayload(overview: {
         symbol: string;
         mintAddress: string;
         quantity: number;
+        costBasisUsd?: number | null;
         priceUsd: number | null;
         valueUsd: number | null;
+        unrealizedPnlUsd?: number | null;
+        realizedPnlUsd?: number | null;
         provider: string | null;
         updatedAt: number;
     }>;
@@ -580,8 +569,11 @@ function sanitizePacificaKnowledgePayload(overview: {
                 symbol: position.symbol,
                 mint_address: position.mintAddress,
                 quantity: position.quantity,
+                cost_basis_usd: position.costBasisUsd ?? null,
                 price_usd: position.priceUsd,
                 value_usd: position.valueUsd,
+                unrealized_pnl_usd: position.unrealizedPnlUsd ?? null,
+                realized_pnl_usd: position.realizedPnlUsd ?? null,
                 provider: position.provider,
                 updated_at: position.updatedAt,
             }))
@@ -714,6 +706,7 @@ export class AirificaServer {
                     isAdmin: admin,
                     source: "wallet_auth",
                 });
+                void refreshOnchainPortfolioSnapshot(address);
 
                 res.json({
                     token: signAuthToken(address, admin),
@@ -824,7 +817,7 @@ export class AirificaServer {
             if (Number.isFinite(amountUsd) && amountUsd > 0)
                 facts.push(`Notional: ${amountUsd.toFixed(2)} USD`);
             if (Number.isFinite(quantity) && quantity > 0)
-                facts.push(`Size: ${quantity.toFixed(6)}`);
+                facts.push(`Size: ${formatAssetQuantity(quantity)}`);
             if (facts.length)
                 lines.push(facts.join(" · "));
 
@@ -893,6 +886,156 @@ export class AirificaServer {
         };
 
         const pacificaKnowledgeCache = new Map<string, PacificaKnowledgeCacheEntry>();
+        type OnchainPortfolioRefreshEntry = {
+            lastAccessAt: number;
+            refreshPromise: Promise<void> | null;
+            timer: NodeJS.Timeout | null;
+        };
+
+        const onchainPortfolioRefreshCache = new Map<string, OnchainPortfolioRefreshEntry>();
+
+        const getOrCreateOnchainPortfolioEntry = (walletAddress: string) => {
+            let entry = onchainPortfolioRefreshCache.get(walletAddress);
+            if (entry)
+                return entry;
+
+            entry = {
+                lastAccessAt: Date.now(),
+                refreshPromise: null,
+                timer: null,
+            };
+            onchainPortfolioRefreshCache.set(walletAddress, entry);
+            return entry;
+        };
+
+        const refreshOnchainPortfolioSnapshot = async (walletAddress: string) => {
+            const entry = getOrCreateOnchainPortfolioEntry(walletAddress);
+            entry.lastAccessAt = Date.now();
+            if (entry.refreshPromise)
+                return entry.refreshPromise;
+
+            entry.refreshPromise = (async () => {
+                const syncedAt = Date.now();
+                const existingWatches = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
+                const watchByMint = new Map(existingWatches.map(item => [String(item.mintAddress || "").trim(), item]));
+                const discoveredBalances = await discoverWalletTokenBalances(walletAddress);
+                const discoveredByMint = new Map(
+                    discoveredBalances.map(item => [String(item.mintAddress || "").trim(), item]),
+                );
+                const candidateMints = new Set<string>([
+                    ...existingWatches.map(item => String(item.mintAddress || "").trim()).filter(Boolean),
+                    ...discoveredBalances.map(item => String(item.mintAddress || "").trim()).filter(Boolean),
+                ]);
+
+                await Promise.all(Array.from(candidateMints).map(async (mintAddress) => {
+                    const discovered = discoveredByMint.get(mintAddress) || null;
+                    const watch = watchByMint.get(mintAddress) || null;
+                    const quantity = Math.max(0, Number(discovered?.quantity || 0));
+                    let market: Awaited<ReturnType<typeof fetchMarketContext>> | null = null;
+                    const marketQuery = watch?.marketQuery || mintAddress;
+
+                    if (quantity > 0) {
+                        try {
+                            market = await fetchMarketContext(marketQuery, "15m", 48);
+                        } catch (error) {
+                            elizaLogger.warn("[client-airifica] onchain inventory market refresh skipped:", {
+                                walletAddress,
+                                mintAddress,
+                                error,
+                            });
+                        }
+                    }
+
+                    const priceUsd = Number(market?.price);
+                    const normalizedPrice = Number.isFinite(priceUsd) && priceUsd > 0
+                        ? priceUsd
+                        : (Number.isFinite(Number(watch?.lastPriceUsd || 0)) && Number(watch?.lastPriceUsd || 0) > 0
+                            ? Number(watch?.lastPriceUsd || 0)
+                            : null);
+                    const normalizedValue = normalizedPrice != null && quantity > 0 ? normalizedPrice * quantity : null;
+
+                    this.stateStore.syncOnchainSpotHolding(walletAddress, mintAddress, {
+                        symbol: market?.symbol || watch?.symbol || null,
+                        marketQuery: market?.requestQuery || watch?.marketQuery || mintAddress,
+                        quantity,
+                        decimals: Number.isFinite(Number(discovered?.decimals)) ? Number(discovered?.decimals) : watch?.decimals ?? null,
+                        priceUsd: normalizedPrice,
+                        valueUsd: normalizedValue,
+                        txSignature: watch?.lastTxSignature || null,
+                        lastSyncedAt: syncedAt,
+                    });
+                }));
+
+                const refreshedWatches = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
+                this.stateStore.markOnchainWalletSnapshotSynced(walletAddress, {
+                    lastSyncedAt: syncedAt,
+                    itemCount: refreshedWatches.filter(item => Number(item.lastQuantity || 0) > 0).length,
+                    source: "rpc",
+                });
+            })()
+                .catch((error) => {
+                    elizaLogger.warn("[client-airifica] onchain portfolio refresh failed:", {
+                        walletAddress,
+                        error,
+                    });
+                })
+                .finally(() => {
+                    const latest = onchainPortfolioRefreshCache.get(walletAddress);
+                    if (latest)
+                        latest.refreshPromise = null;
+                });
+
+            return entry.refreshPromise;
+        };
+
+        const ensureOnchainPortfolioTicker = (walletAddress: string) => {
+            const entry = getOrCreateOnchainPortfolioEntry(walletAddress);
+            entry.lastAccessAt = Date.now();
+            if (entry.timer)
+                return entry;
+
+            entry.timer = setInterval(() => {
+                const current = onchainPortfolioRefreshCache.get(walletAddress);
+                if (!current)
+                    return;
+
+                if (Date.now() - current.lastAccessAt > AIRIFICA_ONCHAIN_PORTFOLIO_IDLE_MS) {
+                    if (current.timer)
+                        clearInterval(current.timer);
+                    onchainPortfolioRefreshCache.delete(walletAddress);
+                    return;
+                }
+
+                void refreshOnchainPortfolioSnapshot(walletAddress);
+            }, AIRIFICA_ONCHAIN_PORTFOLIO_SYNC_MS);
+
+            return entry;
+        };
+
+        const getOnchainPortfolioSnapshot = async (walletAddress: string, options?: { force?: boolean; waitIfEmpty?: boolean }) => {
+            const entry = ensureOnchainPortfolioTicker(walletAddress);
+            entry.lastAccessAt = Date.now();
+            const watches = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
+            const syncRecord = this.stateStore.getOnchainWalletSync(walletAddress);
+            const lastSyncedAt = Number(syncRecord?.lastSyncedAt || 0);
+            const isFresh = lastSyncedAt > 0 && (Date.now() - lastSyncedAt) < AIRIFICA_ONCHAIN_PORTFOLIO_SYNC_MS;
+            const hasSnapshot = lastSyncedAt > 0 || watches.length > 0;
+
+            if (options?.force) {
+                await refreshOnchainPortfolioSnapshot(walletAddress);
+                return this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
+            }
+
+            if (!hasSnapshot && options?.waitIfEmpty !== false) {
+                await refreshOnchainPortfolioSnapshot(walletAddress);
+                return this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
+            }
+
+            if (!isFresh)
+                void refreshOnchainPortfolioSnapshot(walletAddress);
+
+            return watches;
+        };
 
         const getOrCreatePacificaKnowledgeEntry = (walletAddress: string) => {
             let entry = pacificaKnowledgeCache.get(walletAddress);
@@ -1015,74 +1158,50 @@ export class AirificaServer {
         };
 
         const buildOnchainSpotPositions = async (walletAddress: string) => {
-            const watches = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress);
-            const discoveredBalances = await discoverWalletTokenBalances(walletAddress);
-            if (!watches.length && !discoveredBalances.length)
+            const watches = await getOnchainPortfolioSnapshot(walletAddress, { waitIfEmpty: true });
+            if (!watches.length)
                 return [];
 
-            const watchByMint = new Map(watches.map(watch => [watch.mintAddress, watch]));
-            const candidateMints = new Set<string>([
-                ...watches.map(watch => watch.mintAddress),
-                ...discoveredBalances.map(balance => balance.mintAddress),
-            ]);
+            const positions = watches
+                .map((watch) => {
+                    const mintAddress = String(watch.mintAddress || "").trim();
+                    if (!mintAddress)
+                        return null;
 
-            const positions = await Promise.all(Array.from(candidateMints).map(async (mintAddress) => {
-                if (!mintAddress)
-                    return null;
+                    const quantity = Math.max(0, Number(watch.lastQuantity || 0));
+                    if (!Number.isFinite(quantity) || quantity <= 0)
+                        return null;
 
-                const watch = watchByMint.get(mintAddress) || null;
-                const discoveredBalance = discoveredBalances.find(balance => balance.mintAddress === mintAddress) || null;
-                const balance = discoveredBalance || await readSpotTokenBalance(walletAddress, mintAddress);
-                const quantity = Number(balance?.quantity || 0);
+                    const normalizedPrice = Number.isFinite(Number(watch.lastPriceUsd || 0)) && Number(watch.lastPriceUsd || 0) > 0
+                        ? Number(watch.lastPriceUsd || 0)
+                        : null;
+                    const valueUsd = Number.isFinite(Number(watch.lastValueUsd || 0)) && Number(watch.lastValueUsd || 0) > 0
+                        ? Number(watch.lastValueUsd || 0)
+                        : (normalizedPrice != null ? normalizedPrice * quantity : null);
+                    const costBasisUsd = Number(watch.costBasisUsd || 0);
+                    const unrealizedPnlUsd = valueUsd != null && costBasisUsd > 0 ? valueUsd - costBasisUsd : null;
+                    const fallbackSymbol = watch.symbol || `${mintAddress.slice(0, 4)}…${mintAddress.slice(-4)}`;
 
-                let market: Awaited<ReturnType<typeof fetchMarketContext>> | null = null;
-                try {
-                    market = await fetchMarketContext(watch?.marketQuery || mintAddress, "15m", 96);
-                } catch (error) {
-                    elizaLogger.warn("[client-airifica] onchain market context lookup skipped:", {
-                        walletAddress,
+                    return {
+                        symbol: fallbackSymbol,
                         mintAddress,
-                        error,
-                    });
-                }
-                const priceUsd = Number(market?.price);
-                const normalizedPrice = Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
-                const syncedWatch = this.stateStore.syncOnchainSpotHolding(walletAddress, mintAddress, {
-                    symbol: market?.symbol || watch?.symbol || null,
-                    marketQuery: watch?.marketQuery || market?.requestQuery || mintAddress,
-                    quantity,
-                    priceUsd: normalizedPrice,
-                    txSignature: watch?.lastTxSignature || null,
-                });
-
-                if (!Number.isFinite(quantity) || quantity <= 0)
-                    return null;
-
-                const valueUsd = normalizedPrice != null ? normalizedPrice * quantity : null;
-                const costBasisUsd = Number(syncedWatch.costBasisUsd || 0);
-                const unrealizedPnlUsd = valueUsd != null && costBasisUsd > 0 ? valueUsd - costBasisUsd : null;
-                const fallbackSymbol = syncedWatch.symbol || watch?.symbol || `${mintAddress.slice(0, 4)}…${mintAddress.slice(-4)}`;
-
-                return {
-                    symbol: market?.symbol || fallbackSymbol,
-                    mintAddress,
-                    quantity,
-                    decimals: Number(balance?.decimals || 0),
-                    priceUsd: normalizedPrice,
-                    valueUsd,
-                    costBasisUsd: costBasisUsd > 0 ? costBasisUsd : null,
-                    unrealizedPnlUsd,
-                    realizedPnlUsd: Number.isFinite(Number(syncedWatch.realizedPnlUsd || 0)) ? Number(syncedWatch.realizedPnlUsd || 0) : null,
-                    provider: market?.provider || null,
-                    marketQuery: syncedWatch.marketQuery || watch?.marketQuery || mintAddress,
-                    lastTradeAt: syncedWatch.lastTradeAt || watch?.lastTradeAt || watch?.updatedAt || Date.now(),
-                    lastTxSignature: syncedWatch.lastTxSignature || watch?.lastTxSignature || null,
-                    updatedAt: syncedWatch.updatedAt || watch?.updatedAt || Date.now(),
-                };
-            }));
+                        quantity,
+                        decimals: Number.isFinite(Number(watch.decimals)) ? Number(watch.decimals) : 0,
+                        priceUsd: normalizedPrice,
+                        valueUsd,
+                        costBasisUsd: costBasisUsd > 0 ? costBasisUsd : null,
+                        unrealizedPnlUsd,
+                        realizedPnlUsd: Number.isFinite(Number(watch.realizedPnlUsd || 0)) ? Number(watch.realizedPnlUsd || 0) : null,
+                        provider: watch.marketQuery && watch.marketQuery !== mintAddress ? "cached" : null,
+                        marketQuery: watch.marketQuery || mintAddress,
+                        lastTradeAt: watch.lastTradeAt || watch.updatedAt || Date.now(),
+                        lastTxSignature: watch.lastTxSignature || null,
+                        updatedAt: watch.lastSyncedAt || watch.updatedAt || Date.now(),
+                    };
+                })
+                .filter((position): position is NonNullable<typeof position> => Boolean(position));
 
             return positions
-                .filter((position): position is NonNullable<typeof position> => Boolean(position))
                 .sort((left, right) => {
                     const valueDelta = Number(right.valueUsd || 0) - Number(left.valueUsd || 0);
                     if (valueDelta !== 0)
@@ -1261,21 +1380,10 @@ export class AirificaServer {
             const positions = Array.isArray(overview.positions) ? overview.positions : [];
             const onchainPositions = Array.isArray((overview as any).onchainPositions) ? (overview as any).onchainPositions : [];
             const tradeLedger = this.stateStore.listTradeLedgerForWallet(walletAddress);
-            const onchainWatchMap = new Map(
-                this.stateStore.listOnchainSpotWatchesForWallet(walletAddress)
-                    .map(item => [String(item.mintAddress || "").trim(), item]),
-            );
             const realizedPnlUsd = tradeLedger.reduce((sum, item) => sum + Number(item.realizedPnlUsd || 0), 0);
-            const onchainPnlUsd = onchainPositions.reduce((sum: number, position: any) => {
-                const watch = onchainWatchMap.get(String(position.mintAddress || "").trim());
-                if (!watch)
-                    return sum;
-                const lastNotionalUsd = Number(watch.costBasisUsd || 0);
-                const currentValueUsd = Number(position.valueUsd || 0);
-                if (!Number.isFinite(lastNotionalUsd) || lastNotionalUsd <= 0 || !Number.isFinite(currentValueUsd))
-                    return sum;
-                return sum + (currentValueUsd - lastNotionalUsd);
-            }, 0);
+            const onchainPnlUsd = onchainPositions.reduce((sum: number, position: any) =>
+                sum + Number(position.unrealizedPnlUsd || 0),
+            0);
             const totalPnlUsd = realizedPnlUsd + positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0) + onchainPnlUsd;
             const latestTrade = tradeLedger[0] || null;
             const effectiveLatestTrade = latestTrade
@@ -2167,6 +2275,10 @@ export class AirificaServer {
                     this.stateStore.upsertOnchainSpotWatch(auth.address, outputMint, {
                         symbol,
                         marketQuery,
+                        decimals: existingSpotWatch?.decimals ?? null,
+                        lastPriceUsd: Number.isFinite(amountUsd) && Number.isFinite(quantity) && quantity > 0 ? amountUsd / quantity : existingSpotWatch?.lastPriceUsd ?? null,
+                        lastValueUsd: Number.isFinite(amountUsd) ? amountUsd : existingSpotWatch?.lastValueUsd ?? null,
+                        lastSyncedAt: Date.now(),
                         lastTradeAt: Date.now(),
                         lastTxSignature: txSignature,
                         lastNotionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
@@ -2174,6 +2286,13 @@ export class AirificaServer {
                         costBasisUsd: Number.isFinite(nextSpotCostBasisUsd) ? nextSpotCostBasisUsd : null,
                         realizedPnlUsd: Number(existingSpotWatch?.realizedPnlUsd || 0),
                     });
+                    this.stateStore.markOnchainWalletSnapshotSynced(auth.address, {
+                        lastSyncedAt: Date.now(),
+                        itemCount: this.stateStore.listOnchainSpotWatchesForWallet(auth.address)
+                            .filter(item => Number(item.lastQuantity || 0) > 0).length,
+                        source: "trade_event",
+                    });
+                    void refreshOnchainPortfolioSnapshot(auth.address);
                 }
                 this.stateStore.touchUser(auth.address, { source: "telegram_notify" });
                 trackTradeExecutionCounters({
@@ -2222,6 +2341,7 @@ export class AirificaServer {
                 this.stateStore.touchUser(link.walletAddress, { source: "telegram_link" });
                 this.stateStore.incrementCounter("telegram_link", "linked");
                 void maybePrimePacificaKnowledge(link.walletAddress);
+                void refreshOnchainPortfolioSnapshot(link.walletAddress);
                 res.json({
                     ok: true,
                     link: {
