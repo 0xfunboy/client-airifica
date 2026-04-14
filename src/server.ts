@@ -260,6 +260,22 @@ function formatAssetQuantity(value: number) {
     });
 }
 
+function formatTriggerPrice(value: number) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0)
+        return "0";
+
+    const absolute = Math.abs(numeric);
+    if (absolute >= 1)
+        return numeric.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 4 });
+
+    const maximumFractionDigits = Math.min(8, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 2));
+    return numeric.toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits,
+    });
+}
+
 function shortWallet(value: unknown) {
     const text = String(value ?? "").trim();
     if (text.length <= 14)
@@ -481,7 +497,7 @@ async function discoverWalletTokenBalances(walletAddress: string) {
 
     const owner = new PublicKey(walletAddress);
     const accounts = await solanaConnection.getParsedTokenAccountsByOwner(owner, { programId: SOLANA_TOKEN_PROGRAM_ID });
-    const balances = new Map<string, { mintAddress: string; quantity: number; decimals: number }>();
+    const balances = new Map<string, { mintAddress: string; quantity: number; quantityAtomic: string; decimals: number }>();
 
     for (const account of accounts.value) {
         const parsedInfo = (account.account.data as any)?.parsed?.info;
@@ -490,6 +506,7 @@ async function discoverWalletTokenBalances(walletAddress: string) {
             continue;
         const tokenAmount = parsedInfo?.tokenAmount;
         const quantity = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0);
+        const quantityAtomic = String(tokenAmount?.amount || "").trim();
         if (!Number.isFinite(quantity) || quantity <= 0)
             continue;
         const decimals = Number(tokenAmount?.decimals);
@@ -497,6 +514,9 @@ async function discoverWalletTokenBalances(walletAddress: string) {
         balances.set(mintAddress, {
             mintAddress,
             quantity: Number(existing?.quantity || 0) + quantity,
+            quantityAtomic: existing?.quantityAtomic && /^\d+$/.test(existing.quantityAtomic) && /^\d+$/.test(quantityAtomic)
+                ? (BigInt(existing.quantityAtomic) + BigInt(quantityAtomic)).toString()
+                : quantityAtomic,
             decimals: Number.isFinite(decimals) ? decimals : Number(existing?.decimals || 0),
         });
     }
@@ -513,11 +533,15 @@ function sanitizePacificaKnowledgePayload(overview: {
         symbol: string;
         mintAddress: string;
         quantity: number;
+        quantityAtomic?: string | null;
         costBasisUsd?: number | null;
         priceUsd: number | null;
         valueUsd: number | null;
         unrealizedPnlUsd?: number | null;
         realizedPnlUsd?: number | null;
+        takeProfitPrice?: number | null;
+        stopLossPrice?: number | null;
+        triggerOrderId?: string | null;
         provider: string | null;
         updatedAt: number;
     }>;
@@ -569,11 +593,15 @@ function sanitizePacificaKnowledgePayload(overview: {
                 symbol: position.symbol,
                 mint_address: position.mintAddress,
                 quantity: position.quantity,
+                quantity_atomic: position.quantityAtomic ?? null,
                 cost_basis_usd: position.costBasisUsd ?? null,
                 price_usd: position.priceUsd,
                 value_usd: position.valueUsd,
                 unrealized_pnl_usd: position.unrealizedPnlUsd ?? null,
                 realized_pnl_usd: position.realizedPnlUsd ?? null,
+                take_profit_price: position.takeProfitPrice ?? null,
+                stop_loss_price: position.stopLossPrice ?? null,
+                trigger_order_id: position.triggerOrderId ?? null,
                 provider: position.provider,
                 updated_at: position.updatedAt,
             }))
@@ -795,14 +823,20 @@ export class AirificaServer {
         };
 
         const buildTelegramTradeAlertText = (payload: {
+            kind?: "TRADE_OPENED" | "POSITION_CLOSED";
             venue?: string | null;
             symbol: string;
             side?: string | null;
             amountUsd?: number | null;
             quantity?: number | null;
+            tpPriceUsd?: number | null;
+            slPriceUsd?: number | null;
+            triggerArmed?: boolean | null;
+            triggerOrderId?: string | null;
             txSignature?: string | null;
             explorerUrl?: string | null;
         }) => {
+            const kind = payload.kind || "TRADE_OPENED";
             const venue = String(payload.venue || "frontend").trim();
             const symbol = normalizeSymbol(payload.symbol || "");
             const side = normalizePacificaSide(payload.side || "", null) || String(payload.side || "").trim().toUpperCase() || "TRADE";
@@ -810,7 +844,9 @@ export class AirificaServer {
             const quantity = Number(payload.quantity);
             const isJupiter = /jupiter/i.test(venue);
             const lines = [
-                `Opened ${side} ${symbol}${venue ? ` via ${venue}` : ""}.`,
+                kind === "POSITION_CLOSED"
+                    ? `Closed ${symbol}${venue ? ` via ${venue}` : ""}.`
+                    : `Opened ${side} ${symbol}${venue ? ` via ${venue}` : ""}.`,
             ];
 
             const facts: string[] = [];
@@ -821,8 +857,17 @@ export class AirificaServer {
             if (facts.length)
                 lines.push(facts.join(" · "));
 
-            if (isJupiter)
-                lines.push("TP/SL levels remain analytical only for spot swaps.");
+            if (isJupiter && kind === "TRADE_OPENED") {
+                if (payload.triggerArmed) {
+                    const triggerLabel = payload.triggerOrderId ? ` (${payload.triggerOrderId})` : "";
+                    lines.push(`TP/SL armed on Jupiter Trigger${triggerLabel}.`);
+                } else if (Number(payload.tpPriceUsd || 0) > 0 || Number(payload.slPriceUsd || 0) > 0) {
+                    lines.push([
+                        Number(payload.tpPriceUsd || 0) > 0 ? `TP ${formatTriggerPrice(Number(payload.tpPriceUsd || 0))}` : null,
+                        Number(payload.slPriceUsd || 0) > 0 ? `SL ${formatTriggerPrice(Number(payload.slPriceUsd || 0))}` : null,
+                    ].filter(Boolean).join(" · "));
+                }
+            }
 
             if (payload.explorerUrl) {
                 lines.push(payload.explorerUrl);
@@ -958,6 +1003,7 @@ export class AirificaServer {
                         symbol: market?.symbol || watch?.symbol || null,
                         marketQuery: market?.requestQuery || watch?.marketQuery || mintAddress,
                         quantity,
+                        quantityAtomic: discovered?.quantityAtomic || watch?.lastQuantityAtomic || null,
                         decimals: Number.isFinite(Number(discovered?.decimals)) ? Number(discovered?.decimals) : watch?.decimals ?? null,
                         priceUsd: normalizedPrice,
                         valueUsd: normalizedValue,
@@ -1186,12 +1232,17 @@ export class AirificaServer {
                         symbol: fallbackSymbol,
                         mintAddress,
                         quantity,
+                        quantityAtomic: watch.lastQuantityAtomic || null,
                         decimals: Number.isFinite(Number(watch.decimals)) ? Number(watch.decimals) : 0,
                         priceUsd: normalizedPrice,
                         valueUsd,
                         costBasisUsd: costBasisUsd > 0 ? costBasisUsd : null,
                         unrealizedPnlUsd,
                         realizedPnlUsd: Number.isFinite(Number(watch.realizedPnlUsd || 0)) ? Number(watch.realizedPnlUsd || 0) : null,
+                        takeProfitPrice: Number.isFinite(Number(watch.takeProfitPrice || 0)) ? Number(watch.takeProfitPrice || 0) : null,
+                        stopLossPrice: Number.isFinite(Number(watch.stopLossPrice || 0)) ? Number(watch.stopLossPrice || 0) : null,
+                        triggerOrderId: watch.triggerOrderId || null,
+                        triggerTxSignature: watch.triggerTxSignature || null,
                         provider: watch.marketQuery && watch.marketQuery !== mintAddress ? "cached" : null,
                         marketQuery: watch.marketQuery || mintAddress,
                         lastTradeAt: watch.lastTradeAt || watch.updatedAt || Date.now(),
@@ -2194,6 +2245,9 @@ export class AirificaServer {
                 return;
 
             try {
+                const notificationKind = String(req.body?.kind || "TRADE_OPENED").trim().toUpperCase() === "POSITION_CLOSED"
+                    ? "POSITION_CLOSED"
+                    : "TRADE_OPENED";
                 const symbol = normalizeSymbol(req.body?.symbol || "");
                 if (!symbol) {
                     res.status(400).json({ ok: false, error: "symbol required" });
@@ -2203,11 +2257,18 @@ export class AirificaServer {
                 const proposalId = Number(req.body?.proposalId);
                 const amountUsd = Number(req.body?.amountUsd);
                 const quantity = Number(req.body?.quantity);
+                const quantityAtomic = String(req.body?.quantityAtomic || "").trim();
                 const venue = String(req.body?.venue || "frontend").trim() || "frontend";
                 const txSignature = req.body?.txSignature ? String(req.body.txSignature) : null;
                 const explorerUrl = req.body?.explorerUrl ? String(req.body.explorerUrl) : null;
                 const outputMint = String(req.body?.outputMint || "").trim();
-                const marketQuery = normalizeMarketContextQuery(req.body?.marketQuery || outputMint || symbol) || symbol;
+                const positionMint = String(req.body?.positionMint || outputMint || "").trim();
+                const marketQuery = normalizeMarketContextQuery(req.body?.marketQuery || positionMint || outputMint || symbol) || symbol;
+                const tpPriceUsd = Number(req.body?.tpPriceUsd);
+                const slPriceUsd = Number(req.body?.slPriceUsd);
+                const triggerArmed = Boolean(req.body?.triggerArmed);
+                const triggerOrderId = req.body?.triggerOrderId ? String(req.body.triggerOrderId) : null;
+                const triggerTxSignature = req.body?.triggerTxSignature ? String(req.body.triggerTxSignature) : null;
 
                 if (Number.isFinite(proposalId) && proposalId > 0) {
                     const storedProposal = this.stateStore.getProposal(proposalId);
@@ -2224,67 +2285,120 @@ export class AirificaServer {
                         });
                     }
                 }
-                const existingSpotWatch = outputMint
-                    ? this.stateStore.getOnchainSpotWatch(auth.address, outputMint)
+                const existingSpotWatch = positionMint
+                    ? this.stateStore.getOnchainSpotWatch(auth.address, positionMint)
                     : null;
-                const nextSpotQuantity = Number.isFinite(quantity) && quantity > 0
-                    ? Math.max(0, Number(existingSpotWatch?.lastQuantity || 0) + quantity)
-                    : Number(existingSpotWatch?.lastQuantity || 0);
-                const nextSpotCostBasisUsd = Number.isFinite(amountUsd) && amountUsd > 0
-                    ? Math.max(0, Number(existingSpotWatch?.costBasisUsd || 0) + amountUsd)
-                    : Number(existingSpotWatch?.costBasisUsd || 0);
+                const currentQuantityAtomic = String(existingSpotWatch?.lastQuantityAtomic || "").trim();
+                const soldQuantityAtomic = /^\d+$/.test(quantityAtomic) ? quantityAtomic : "";
+                const nextSpotQuantity = notificationKind === "POSITION_CLOSED"
+                    ? (Number.isFinite(quantity) && quantity > 0
+                        ? Math.max(0, Number(existingSpotWatch?.lastQuantity || 0) - quantity)
+                        : 0)
+                    : (Number.isFinite(quantity) && quantity > 0
+                        ? Math.max(0, Number(existingSpotWatch?.lastQuantity || 0) + quantity)
+                        : Number(existingSpotWatch?.lastQuantity || 0));
+                const nextSpotQuantityAtomic = notificationKind === "POSITION_CLOSED"
+                    ? (() => {
+                        if (/^\d+$/.test(currentQuantityAtomic) && soldQuantityAtomic) {
+                            const remaining = BigInt(currentQuantityAtomic) > BigInt(soldQuantityAtomic)
+                                ? BigInt(currentQuantityAtomic) - BigInt(soldQuantityAtomic)
+                                : 0n;
+                            return remaining.toString();
+                        }
+                        return nextSpotQuantity > 0 ? currentQuantityAtomic || null : "0";
+                    })()
+                    : (/^\d+$/.test(currentQuantityAtomic) && soldQuantityAtomic
+                        ? (BigInt(currentQuantityAtomic || "0") + BigInt(soldQuantityAtomic)).toString()
+                        : soldQuantityAtomic || currentQuantityAtomic || null);
                 this.stateStore.appendTradeLedgerRecord({
                     walletAddress: auth.address,
                     venue: "jupiter",
                     marketType: "spot",
                     symbol,
-                    side: String(req.body?.side || "").trim().toUpperCase() === "SELL" ? "SELL" : "BUY",
+                    side: notificationKind === "POSITION_CLOSED"
+                        ? "SELL"
+                        : (String(req.body?.side || "").trim().toUpperCase() === "SELL" ? "SELL" : "BUY"),
                     quantity: Number.isFinite(quantity) ? quantity : null,
                     notionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
                     marginUsd: null,
                     leverage: 1,
                     realizedPnlUsd: null,
-                    mintAddress: outputMint || null,
+                    mintAddress: positionMint || null,
                     orderId: null,
                     txSignature,
                     proposalId: Number.isFinite(proposalId) && proposalId > 0 ? proposalId : null,
                     executionSource: "web",
-                    note: "Jupiter spot execution",
+                    note: notificationKind === "POSITION_CLOSED" ? "Jupiter spot close" : "Jupiter spot execution",
                 });
 
                 const text = buildTelegramTradeAlertText({
+                    kind: notificationKind,
                     venue,
                     symbol,
                     side: req.body?.side ? String(req.body.side) : null,
                     amountUsd: Number.isFinite(amountUsd) ? amountUsd : null,
                     quantity: Number.isFinite(quantity) ? quantity : null,
+                    tpPriceUsd: Number.isFinite(tpPriceUsd) ? tpPriceUsd : null,
+                    slPriceUsd: Number.isFinite(slPriceUsd) ? slPriceUsd : null,
+                    triggerArmed,
+                    triggerOrderId,
                     txSignature,
                     explorerUrl,
                 });
 
-                const notifications = this.stateStore.createTelegramNotifications(auth.address, "TRADE_OPENED", text, {
+                const notifications = this.stateStore.createTelegramNotifications(auth.address, notificationKind, text, {
                     proposalId: Number.isFinite(proposalId) && proposalId > 0 ? proposalId : null,
                     symbol,
                     venue,
                     txSignature,
                     explorerUrl,
                     outputMint: outputMint || null,
+                    positionMint: positionMint || null,
                     marketQuery,
+                    tpPriceUsd: Number.isFinite(tpPriceUsd) ? tpPriceUsd : null,
+                    slPriceUsd: Number.isFinite(slPriceUsd) ? slPriceUsd : null,
+                    triggerArmed,
+                    triggerOrderId,
+                    triggerTxSignature,
+                    quantity: Number.isFinite(quantity) ? quantity : null,
                 });
-                if (outputMint && venue.toLowerCase().includes("jupiter")) {
-                    this.stateStore.upsertOnchainSpotWatch(auth.address, outputMint, {
+                if (positionMint && venue.toLowerCase().includes("jupiter")) {
+                    const effectivePriceUsd = Number.isFinite(amountUsd) && Number.isFinite(quantity) && quantity > 0
+                        ? amountUsd / quantity
+                        : existingSpotWatch?.lastPriceUsd ?? null;
+                    const nextWatch = this.stateStore.syncOnchainSpotHolding(auth.address, positionMint, {
                         symbol,
                         marketQuery,
+                        quantity: Number.isFinite(nextSpotQuantity) ? nextSpotQuantity : 0,
+                        quantityAtomic: nextSpotQuantity > 0 ? nextSpotQuantityAtomic : null,
                         decimals: existingSpotWatch?.decimals ?? null,
-                        lastPriceUsd: Number.isFinite(amountUsd) && Number.isFinite(quantity) && quantity > 0 ? amountUsd / quantity : existingSpotWatch?.lastPriceUsd ?? null,
-                        lastValueUsd: Number.isFinite(amountUsd) ? amountUsd : existingSpotWatch?.lastValueUsd ?? null,
+                        priceUsd: effectivePriceUsd,
+                        valueUsd: nextSpotQuantity > 0 && Number.isFinite(Number(effectivePriceUsd))
+                            ? Number(effectivePriceUsd) * nextSpotQuantity
+                            : 0,
+                        txSignature,
+                        lastSyncedAt: Date.now(),
+                    });
+                    this.stateStore.upsertOnchainSpotWatch(auth.address, positionMint, {
+                        symbol,
+                        marketQuery: notificationKind === "POSITION_CLOSED" && nextSpotQuantity <= 0
+                            ? existingSpotWatch?.marketQuery || marketQuery
+                            : marketQuery,
+                        decimals: existingSpotWatch?.decimals ?? null,
+                        lastQuantityAtomic: nextWatch.lastQuantityAtomic,
+                        lastPriceUsd: nextWatch.lastPriceUsd,
+                        lastValueUsd: nextWatch.lastValueUsd,
                         lastSyncedAt: Date.now(),
                         lastTradeAt: Date.now(),
                         lastTxSignature: txSignature,
-                        lastNotionalUsd: Number.isFinite(amountUsd) ? amountUsd : null,
-                        lastQuantity: Number.isFinite(nextSpotQuantity) ? nextSpotQuantity : null,
-                        costBasisUsd: Number.isFinite(nextSpotCostBasisUsd) ? nextSpotCostBasisUsd : null,
-                        realizedPnlUsd: Number(existingSpotWatch?.realizedPnlUsd || 0),
+                        lastNotionalUsd: nextWatch.lastNotionalUsd,
+                        lastQuantity: nextWatch.lastQuantity,
+                        costBasisUsd: nextWatch.costBasisUsd,
+                        realizedPnlUsd: nextWatch.realizedPnlUsd,
+                        takeProfitPrice: notificationKind === "TRADE_OPENED" && triggerArmed && Number.isFinite(tpPriceUsd) ? tpPriceUsd : null,
+                        stopLossPrice: notificationKind === "TRADE_OPENED" && triggerArmed && Number.isFinite(slPriceUsd) ? slPriceUsd : null,
+                        triggerOrderId: notificationKind === "TRADE_OPENED" && triggerArmed ? triggerOrderId : null,
+                        triggerTxSignature: notificationKind === "TRADE_OPENED" && triggerArmed ? triggerTxSignature : null,
                     });
                     this.stateStore.markOnchainWalletSnapshotSynced(auth.address, {
                         lastSyncedAt: Date.now(),

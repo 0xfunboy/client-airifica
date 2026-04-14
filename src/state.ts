@@ -102,6 +102,7 @@ export interface OnchainSpotWatchRecord {
     symbol: string | null;
     marketQuery: string | null;
     decimals: number | null;
+    lastQuantityAtomic: string | null;
     lastPriceUsd: number | null;
     lastValueUsd: number | null;
     lastSyncedAt: number | null;
@@ -111,6 +112,10 @@ export interface OnchainSpotWatchRecord {
     lastQuantity: number | null;
     costBasisUsd: number | null;
     realizedPnlUsd: number | null;
+    takeProfitPrice: number | null;
+    stopLossPrice: number | null;
+    triggerOrderId: string | null;
+    triggerTxSignature: string | null;
     createdAt: number;
     updatedAt: number;
 }
@@ -309,6 +314,7 @@ CREATE TABLE IF NOT EXISTS airifica_onchain_spot_watches (
     symbol TEXT,
     market_query TEXT,
     decimals INTEGER,
+    last_quantity_atomic TEXT,
     last_price_usd REAL,
     last_value_usd REAL,
     last_synced_at INTEGER,
@@ -318,6 +324,10 @@ CREATE TABLE IF NOT EXISTS airifica_onchain_spot_watches (
     last_quantity REAL,
     cost_basis_usd REAL,
     realized_pnl_usd REAL,
+    take_profit_price REAL,
+    stop_loss_price REAL,
+    trigger_order_id TEXT,
+    trigger_tx_signature TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (wallet_address, mint_address)
@@ -521,6 +531,7 @@ type OnchainSpotWatchRow = {
     symbol: string | null;
     market_query: string | null;
     decimals: number | null;
+    last_quantity_atomic: string | null;
     last_price_usd: number | null;
     last_value_usd: number | null;
     last_synced_at: number | null;
@@ -530,6 +541,10 @@ type OnchainSpotWatchRow = {
     last_quantity: number | null;
     cost_basis_usd: number | null;
     realized_pnl_usd: number | null;
+    take_profit_price: number | null;
+    stop_loss_price: number | null;
+    trigger_order_id: string | null;
+    trigger_tx_signature: string | null;
     created_at: number;
     updated_at: number;
 };
@@ -698,6 +713,7 @@ function mapOnchainSpotWatchRow(row: OnchainSpotWatchRow | undefined | null) {
         symbol: stringOrNull(row.symbol),
         marketQuery: stringOrNull(row.market_query),
         decimals: integerOrNull(row.decimals),
+        lastQuantityAtomic: stringOrNull(row.last_quantity_atomic),
         lastPriceUsd: numberOrNull(row.last_price_usd),
         lastValueUsd: numberOrNull(row.last_value_usd),
         lastSyncedAt: integerOrNull(row.last_synced_at),
@@ -707,6 +723,10 @@ function mapOnchainSpotWatchRow(row: OnchainSpotWatchRow | undefined | null) {
         lastQuantity: numberOrNull(row.last_quantity),
         costBasisUsd: numberOrNull(row.cost_basis_usd),
         realizedPnlUsd: numberOrNull(row.realized_pnl_usd),
+        takeProfitPrice: numberOrNull(row.take_profit_price),
+        stopLossPrice: numberOrNull(row.stop_loss_price),
+        triggerOrderId: stringOrNull(row.trigger_order_id),
+        triggerTxSignature: stringOrNull(row.trigger_tx_signature),
         createdAt: Number(row.created_at),
         updatedAt: Number(row.updated_at),
     } satisfies OnchainSpotWatchRecord;
@@ -761,9 +781,30 @@ export class AirificaStateStore {
         this.maybeImportLegacyState();
     }
 
+    private getTableColumns(tableName: string) {
+        const escapedTable = tableName.replace(/'/g, "''");
+        const rows = this.db
+            .prepare<{ name: string }>(`PRAGMA table_info('${escapedTable}')`)
+            .all();
+        return new Set(rows.map(row => String(row.name || "").trim()).filter(Boolean));
+    }
+
+    private ensureColumn(tableName: string, columnName: string, columnDefinition: string) {
+        const columns = this.getTableColumns(tableName);
+        if (columns.has(columnName))
+            return;
+
+        this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
+    }
+
     private initializeSchema() {
         this.db.exec(AIRIFICA_STATE_SCHEMA);
-        this.setMeta("schema_version", "2");
+        this.ensureColumn("airifica_onchain_spot_watches", "last_quantity_atomic", "last_quantity_atomic TEXT");
+        this.ensureColumn("airifica_onchain_spot_watches", "take_profit_price", "take_profit_price REAL");
+        this.ensureColumn("airifica_onchain_spot_watches", "stop_loss_price", "stop_loss_price REAL");
+        this.ensureColumn("airifica_onchain_spot_watches", "trigger_order_id", "trigger_order_id TEXT");
+        this.ensureColumn("airifica_onchain_spot_watches", "trigger_tx_signature", "trigger_tx_signature TEXT");
+        this.setMeta("schema_version", "3");
     }
 
     private getMeta(key: string) {
@@ -1855,12 +1896,14 @@ export class AirificaStateStore {
     ) {
         const existing = this.getOnchainSpotWatch(walletAddress, mintAddress);
         const now = Date.now();
+        const hasOwn = (key: keyof typeof patch) => Object.prototype.hasOwnProperty.call(patch, key);
         const next: OnchainSpotWatchRecord = {
             walletAddress,
             mintAddress,
             symbol: patch.symbol ?? existing?.symbol ?? null,
             marketQuery: patch.marketQuery ?? existing?.marketQuery ?? null,
             decimals: patch.decimals ?? existing?.decimals ?? null,
+            lastQuantityAtomic: hasOwn("lastQuantityAtomic") ? stringOrNull(patch.lastQuantityAtomic) : existing?.lastQuantityAtomic ?? null,
             lastPriceUsd: patch.lastPriceUsd ?? existing?.lastPriceUsd ?? null,
             lastValueUsd: patch.lastValueUsd ?? existing?.lastValueUsd ?? null,
             lastSyncedAt: patch.lastSyncedAt ?? existing?.lastSyncedAt ?? null,
@@ -1870,6 +1913,10 @@ export class AirificaStateStore {
             lastQuantity: patch.lastQuantity ?? existing?.lastQuantity ?? null,
             costBasisUsd: patch.costBasisUsd ?? existing?.costBasisUsd ?? null,
             realizedPnlUsd: patch.realizedPnlUsd ?? existing?.realizedPnlUsd ?? null,
+            takeProfitPrice: hasOwn("takeProfitPrice") ? numberOrNull(patch.takeProfitPrice) : existing?.takeProfitPrice ?? null,
+            stopLossPrice: hasOwn("stopLossPrice") ? numberOrNull(patch.stopLossPrice) : existing?.stopLossPrice ?? null,
+            triggerOrderId: hasOwn("triggerOrderId") ? stringOrNull(patch.triggerOrderId) : existing?.triggerOrderId ?? null,
+            triggerTxSignature: hasOwn("triggerTxSignature") ? stringOrNull(patch.triggerTxSignature) : existing?.triggerTxSignature ?? null,
             createdAt: existing?.createdAt || now,
             updatedAt: now,
         };
@@ -1882,6 +1929,7 @@ export class AirificaStateStore {
                 symbol,
                 market_query,
                 decimals,
+                last_quantity_atomic,
                 last_price_usd,
                 last_value_usd,
                 last_synced_at,
@@ -1891,13 +1939,18 @@ export class AirificaStateStore {
                 last_quantity,
                 cost_basis_usd,
                 realized_pnl_usd,
+                take_profit_price,
+                stop_loss_price,
+                trigger_order_id,
+                trigger_tx_signature,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(wallet_address, mint_address) DO UPDATE SET
                 symbol = excluded.symbol,
                 market_query = excluded.market_query,
                 decimals = excluded.decimals,
+                last_quantity_atomic = excluded.last_quantity_atomic,
                 last_price_usd = excluded.last_price_usd,
                 last_value_usd = excluded.last_value_usd,
                 last_synced_at = excluded.last_synced_at,
@@ -1907,6 +1960,10 @@ export class AirificaStateStore {
                 last_quantity = excluded.last_quantity,
                 cost_basis_usd = excluded.cost_basis_usd,
                 realized_pnl_usd = excluded.realized_pnl_usd,
+                take_profit_price = excluded.take_profit_price,
+                stop_loss_price = excluded.stop_loss_price,
+                trigger_order_id = excluded.trigger_order_id,
+                trigger_tx_signature = excluded.trigger_tx_signature,
                 updated_at = excluded.updated_at
             `,
         ).run(
@@ -1915,6 +1972,7 @@ export class AirificaStateStore {
             stringOrNull(next.symbol),
             stringOrNull(next.marketQuery),
             integerOrNull(next.decimals),
+            stringOrNull(next.lastQuantityAtomic),
             numberOrNull(next.lastPriceUsd),
             numberOrNull(next.lastValueUsd),
             integerOrNull(next.lastSyncedAt),
@@ -1924,6 +1982,10 @@ export class AirificaStateStore {
             numberOrNull(next.lastQuantity),
             numberOrNull(next.costBasisUsd),
             numberOrNull(next.realizedPnlUsd),
+            numberOrNull(next.takeProfitPrice),
+            numberOrNull(next.stopLossPrice),
+            stringOrNull(next.triggerOrderId),
+            stringOrNull(next.triggerTxSignature),
             Number(next.createdAt),
             Number(next.updatedAt),
         );
@@ -2007,6 +2069,7 @@ export class AirificaStateStore {
             symbol?: string | null;
             marketQuery?: string | null;
             quantity: number;
+            quantityAtomic?: string | null;
             decimals?: number | null;
             priceUsd?: number | null;
             valueUsd?: number | null;
@@ -2045,6 +2108,9 @@ export class AirificaStateStore {
         const nextSymbol = patch.symbol ?? existing?.symbol ?? null;
         const nextDecimals = Number.isFinite(Number(patch.decimals)) ? Number(patch.decimals) : existing?.decimals ?? null;
         const nextMarketQuery = patch.marketQuery ?? existing?.marketQuery ?? null;
+        const nextQuantityAtomic = patch.quantityAtomic != null
+            ? String(patch.quantityAtomic || "").trim() || null
+            : existing?.lastQuantityAtomic ?? null;
         const nextTxSignature = patch.txSignature ?? existing?.lastTxSignature ?? null;
         const nextPriceUsd = hasPrice ? priceUsd : existing?.lastPriceUsd ?? null;
         const nextValueUsd = hasValue
@@ -2057,6 +2123,7 @@ export class AirificaStateStore {
             || nextSymbol !== (existing?.symbol ?? null)
             || nextDecimals !== (existing?.decimals ?? null)
             || nextMarketQuery !== (existing?.marketQuery ?? null)
+            || nextQuantityAtomic !== (existing?.lastQuantityAtomic ?? null)
             || nextTxSignature !== (existing?.lastTxSignature ?? null)
             || nextLastSyncedAt !== (existing?.lastSyncedAt ?? null)
             || Math.abs(Number(nextPriceUsd || 0) - Number(existing?.lastPriceUsd || 0)) > 0.000000001
@@ -2071,6 +2138,7 @@ export class AirificaStateStore {
             symbol: nextSymbol,
             marketQuery: nextMarketQuery,
             decimals: nextDecimals,
+            lastQuantityAtomic: nextQuantityAtomic,
             lastPriceUsd: Number.isFinite(Number(nextPriceUsd)) ? Number(nextPriceUsd) : null,
             lastValueUsd: Number.isFinite(Number(nextValueUsd)) ? Number(nextValueUsd) : null,
             lastSyncedAt: nextLastSyncedAt,
