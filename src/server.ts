@@ -1221,7 +1221,21 @@ export class AirificaServer {
             const account = overview.account;
             const positions = Array.isArray(overview.positions) ? overview.positions : [];
             const onchainPositions = Array.isArray((overview as any).onchainPositions) ? (overview as any).onchainPositions : [];
-            const totalPnlUsd = positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0);
+            const onchainWatchMap = new Map(
+                this.stateStore.listOnchainSpotWatchesForWallet(walletAddress)
+                    .map(item => [String(item.mintAddress || "").trim(), item]),
+            );
+            const onchainPnlUsd = onchainPositions.reduce((sum: number, position: any) => {
+                const watch = onchainWatchMap.get(String(position.mintAddress || "").trim());
+                if (!watch)
+                    return sum;
+                const lastNotionalUsd = Number(watch.lastNotionalUsd || 0);
+                const currentValueUsd = Number(position.valueUsd || 0);
+                if (!Number.isFinite(lastNotionalUsd) || lastNotionalUsd <= 0 || !Number.isFinite(currentValueUsd))
+                    return sum;
+                return sum + (currentValueUsd - lastNotionalUsd);
+            }, 0);
+            const totalPnlUsd = positions.reduce((sum, position) => sum + Number(position.unrealizedPnlUsd || 0), 0) + onchainPnlUsd;
             const latestTrade = this.stateStore.getLatestExecutedProposalForWallet(walletAddress);
             const latestOnchainTrade = this.stateStore.listOnchainSpotWatchesForWallet(walletAddress)
                 .sort((left, right) => Number(right.lastTradeAt || right.updatedAt) - Number(left.lastTradeAt || left.updatedAt))[0] || null;
@@ -1254,6 +1268,26 @@ export class AirificaServer {
                 totalPnlUsd,
                 latestTrade: effectiveLatestTrade,
             };
+        };
+
+        const buildTelegramTradeHistory = async (walletAddress: string) => {
+            const executed = this.stateStore.listProposals()
+                .filter(proposal => proposal.walletAddress === walletAddress && proposal.status === "EXECUTED")
+                .sort((left, right) => Number(right.executedAt || right.updatedAt) - Number(left.executedAt || left.updatedAt))
+                .slice(0, 12)
+                .map((proposal) => ({
+                    id: proposal.id,
+                    symbol: proposal.proposal.symbol,
+                    side: proposal.proposal.side,
+                    venue: proposal.executionVenue || "pacifica",
+                    orderId: proposal.orderId,
+                    notionalUsd: Number(proposal.executedNotionalUsd || 0),
+                    marginUsd: Number(proposal.executedMarginUsd || 0),
+                    leverage: Number(proposal.executedLeverage || 1),
+                    updatedAt: Number(proposal.executedAt || proposal.updatedAt || Date.now()),
+                }));
+
+            return executed;
         };
 
         const STOPWORD_TICKERS = new Set([
@@ -2288,6 +2322,32 @@ export class AirificaServer {
                 });
             } catch (err: any) {
                 elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/positions error:", err);
+                res.status(500).json({ ok: false, error: err?.message || "server error" });
+            }
+        });
+
+        this.app.post("/api/airi3/telegram/internal/history", async (req: Request, res: Response) => {
+            if (!requireTelegramInternal(req, res))
+                return;
+
+            try {
+                const chatId = String(req.body?.chatId || "").trim();
+                const link = this.stateStore.getTelegramLink(chatId);
+                if (!link) {
+                    res.status(404).json({ ok: false, error: "Telegram chat is not linked to any wallet" });
+                    return;
+                }
+
+                const history = await buildTelegramTradeHistory(link.walletAddress);
+                const summary = await buildTelegramWalletSummary(link.walletAddress);
+                res.json({
+                    ok: true,
+                    walletAddress: link.walletAddress,
+                    summary,
+                    history,
+                });
+            } catch (err: any) {
+                elizaLogger.error("[client-airifica] /api/airi3/telegram/internal/history error:", err);
                 res.status(500).json({ ok: false, error: err?.message || "server error" });
             }
         });
