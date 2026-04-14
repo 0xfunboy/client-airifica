@@ -82,6 +82,7 @@ const AIRIFICA_ONCHAIN_PORTFOLIO_IDLE_MS = Math.max(
     AIRIFICA_ONCHAIN_PORTFOLIO_SYNC_MS,
     Number(envValue("ONCHAIN_PORTFOLIO_IDLE_MS", "900000")),
 );
+const AIRIFICA_JUPITER_TRIGGER_MIN_ORDER_USD = Math.max(0, Number(envValue("JUPITER_TRIGGER_MIN_ORDER_USD", "10")));
 const AIRIFICA_ADMIN_WALLETS = new Set(
     envValue("ADMIN_WALLETS")
         .split(/[,\s]+/)
@@ -862,10 +863,18 @@ export class AirificaServer {
                     const triggerLabel = payload.triggerOrderId ? ` (${payload.triggerOrderId})` : "";
                     lines.push(`TP/SL armed on Jupiter Trigger${triggerLabel}.`);
                 } else if (Number(payload.tpPriceUsd || 0) > 0 || Number(payload.slPriceUsd || 0) > 0) {
-                    lines.push([
+                    const levels = [
                         Number(payload.tpPriceUsd || 0) > 0 ? `TP ${formatTriggerPrice(Number(payload.tpPriceUsd || 0))}` : null,
                         Number(payload.slPriceUsd || 0) > 0 ? `SL ${formatTriggerPrice(Number(payload.slPriceUsd || 0))}` : null,
-                    ].filter(Boolean).join(" · "));
+                    ].filter(Boolean).join(" · ");
+                    if (levels)
+                        lines.push(levels);
+
+                    if (Number.isFinite(amountUsd) && amountUsd > 0 && amountUsd < AIRIFICA_JUPITER_TRIGGER_MIN_ORDER_USD) {
+                        lines.push(`TP/SL not armed: Jupiter Trigger requires at least ${formatUsdCompact(AIRIFICA_JUPITER_TRIGGER_MIN_ORDER_USD)} USD.`);
+                    } else {
+                        lines.push("TP/SL not armed on Jupiter Trigger.");
+                    }
                 }
             }
 
