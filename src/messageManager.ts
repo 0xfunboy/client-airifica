@@ -149,7 +149,7 @@ const MARKET_SYMBOL_STOPWORDS = new Set([
 const MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|wallet|position|positions|portfolio|pnl|fundamental|fundamentals|tokenomics|pacifica|jupiter|perp|spot)\b/i;
 const ACTION_MARKET_INTENT_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|ticker|token|tokens|contract|address|ca\b|crypto|coin|coins|market|markets|trade|trading|long|short|buy|sell|entry|take profit|stop loss|tp\b|sl\b|fundamental|fundamentals|tokenomics|jupiter|perp|spot)\b/i;
 const ACTION_ROUTER_HIGH_SIGNAL_PATTERN = /\b(chart|graph|plot|analysis|analyze|analyse|price|quote|worth|cost|news|headline|sentiment|volume|listing|listed|trending|boosted|mentions?|fundamental|fundamentals|tokenomics)\b/i;
-const ACCOUNT_INTENT_PATTERN = /\b(open position|open positions|position|positions|portfolio|account|equity|available|withdrawable|margin|pnl|profit|loss|liquidation|liq|exposure|ready to trade|risk|overexposed|close now|hold now|reduce risk|execution state)\b/i;
+const ACCOUNT_INTENT_PATTERN = /\b(open position|open positions|position|positions|portfolio|account|allocation|holdings|wallet holdings|spot holdings|equity|available|withdrawable|margin|pnl|profit|loss|liquidation|liq|exposure|ready to trade|risk|overexposed|close now|hold now|reduce risk|execution state|past trade|last trade|history|trade history)\b/i;
 const CONVERSATIONAL_FAST_PATH_PATTERN = /\b(hi|hello|hey|yo|gm|gn|good morning|good evening|good night|how are you|how's it going|how is it going|what's up|whats up|who are you|thanks|thank you|ok|okay|cool|nice|great|perfect|understood|got it|help me|help)\b/i;
 
 const TOKEN_ALIAS_OVERRIDES: Record<string, string> = {
@@ -232,6 +232,41 @@ type PacificaKnowledgePayload = {
         isolated?: boolean;
         updated_at?: number;
     }>;
+    onchain_positions?: Array<{
+        symbol?: string;
+        mint_address?: string;
+        quantity?: number;
+        cost_basis_usd?: number | null;
+        price_usd?: number | null;
+        value_usd?: number | null;
+        unrealized_pnl_usd?: number | null;
+        realized_pnl_usd?: number | null;
+        take_profit_price?: number | null;
+        stop_loss_price?: number | null;
+        trigger_order_id?: string | null;
+        updated_at?: number;
+    }>;
+    recent_trades?: Array<{
+        venue?: string;
+        market_type?: string;
+        symbol?: string;
+        side?: string;
+        quantity?: number | null;
+        notional_usd?: number | null;
+        realized_pnl_usd?: number | null;
+        tx_signature?: string | null;
+        created_at?: number;
+    }>;
+    allocation_summary?: {
+        perp_positions_count?: number;
+        spot_positions_count?: number;
+        spot_value_usd?: number;
+        total_unrealized_pnl_usd?: number;
+        total_realized_pnl_usd?: number;
+        latest_trade_symbol?: string | null;
+        latest_trade_side?: string | null;
+        latest_trade_venue?: string | null;
+    } | null;
 };
 
 /**
@@ -584,6 +619,9 @@ export class AirificaMessageManager {
         const status = parsed.pacifica_status || {};
         const account = parsed.pacifica_account || {};
         const positions = Array.isArray(parsed.open_positions) ? parsed.open_positions : [];
+        const onchainPositions = Array.isArray(parsed.onchain_positions) ? parsed.onchain_positions : [];
+        const recentTrades = Array.isArray(parsed.recent_trades) ? parsed.recent_trades : [];
+        const allocationSummary = parsed.allocation_summary || {};
 
         const positionLines = positions.slice(0, 6).map((position, index) => [
             `${index + 1}. ${String(position.symbol || "").toUpperCase()} ${String(position.side || "").toUpperCase()}`,
@@ -599,6 +637,24 @@ export class AirificaMessageManager {
             `liq=${this.formatAccountNumber(position.liquidation_price, 6)}`,
         ].join(" | "));
 
+        const onchainLines = onchainPositions.slice(0, 8).map((position, index) => [
+            `${index + 1}. ${String(position.symbol || "").toUpperCase()}`,
+            `qty=${this.formatAccountNumber(position.quantity, 6)}`,
+            `value_usd=${this.formatAccountNumber(position.value_usd, 4)}`,
+            `pnl_usd=${this.formatAccountNumber(position.unrealized_pnl_usd, 4)}`,
+            `tp=${this.formatAccountNumber(position.take_profit_price, 6)}`,
+            `sl=${this.formatAccountNumber(position.stop_loss_price, 6)}`,
+        ].join(" | "));
+
+        const recentTradeLines = recentTrades.slice(0, 10).map((trade, index) => [
+            `${index + 1}. ${String(trade.symbol || "").toUpperCase()} ${String(trade.side || "").toUpperCase()}`,
+            `venue=${String(trade.venue || "").toLowerCase()}`,
+            `market=${String(trade.market_type || "").toLowerCase()}`,
+            `notional_usd=${this.formatAccountNumber(trade.notional_usd, 2)}`,
+            `qty=${this.formatAccountNumber(trade.quantity, 6)}`,
+            `realized_pnl_usd=${this.formatAccountNumber(trade.realized_pnl_usd, 4)}`,
+        ].join(" | "));
+
         return [
             "# LIVE PACIFICA ACCOUNT SNAPSHOT",
             `ready_to_execute=${Boolean(status.readyToExecute)}`,
@@ -611,10 +667,23 @@ export class AirificaMessageManager {
             `orders_count=${this.formatAccountNumber(account.orders_count, 0)}`,
             `maker_fee_rate=${this.formatAccountNumber(account.maker_fee_rate, 6)}`,
             `taker_fee_rate=${this.formatAccountNumber(account.taker_fee_rate, 6)}`,
+            `spot_positions_count=${this.formatAccountNumber(allocationSummary.spot_positions_count, 0)}`,
+            `spot_value_usd=${this.formatAccountNumber(allocationSummary.spot_value_usd, 4)}`,
+            `total_unrealized_pnl_usd=${this.formatAccountNumber(allocationSummary.total_unrealized_pnl_usd, 4)}`,
+            `total_realized_pnl_usd=${this.formatAccountNumber(allocationSummary.total_realized_pnl_usd, 4)}`,
+            allocationSummary.latest_trade_symbol
+                ? `latest_trade=${String(allocationSummary.latest_trade_side || "").toUpperCase()} ${String(allocationSummary.latest_trade_symbol || "").toUpperCase()} via ${String(allocationSummary.latest_trade_venue || "").toLowerCase()}`
+                : "",
             parsed.onboarding_hint ? `onboarding_hint=${parsed.onboarding_hint}` : "",
             "",
             positions.length ? "OPEN POSITIONS:" : "OPEN POSITIONS: none",
             ...positionLines,
+            "",
+            onchainPositions.length ? "ONCHAIN SPOT HOLDINGS:" : "ONCHAIN SPOT HOLDINGS: none",
+            ...onchainLines,
+            "",
+            recentTrades.length ? "RECENT TRADES:" : "RECENT TRADES: none",
+            ...recentTradeLines,
         ].filter(Boolean).join("\n");
     }
 

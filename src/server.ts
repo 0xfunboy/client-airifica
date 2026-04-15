@@ -549,6 +549,28 @@ function sanitizePacificaKnowledgePayload(overview: {
     accountMissing?: boolean;
     minimumDepositUsd?: number | null;
     onboardingHint?: string | null;
+}, options?: {
+    recentTrades?: Array<{
+        venue: string;
+        marketType: string;
+        symbol: string;
+        side: string;
+        quantity: number | null;
+        notionalUsd: number | null;
+        realizedPnlUsd: number | null;
+        txSignature: string | null;
+        createdAt: number;
+    }>;
+    allocationSummary?: {
+        perpPositionsCount: number;
+        spotPositionsCount: number;
+        spotValueUsd: number;
+        totalUnrealizedPnlUsd: number;
+        totalRealizedPnlUsd: number;
+        latestTradeSymbol: string | null;
+        latestTradeSide: string | null;
+        latestTradeVenue: string | null;
+    } | null;
 }) {
     return {
         pacifica_status: overview.status,
@@ -607,6 +629,31 @@ function sanitizePacificaKnowledgePayload(overview: {
                 updated_at: position.updatedAt,
             }))
             : [],
+        recent_trades: Array.isArray(options?.recentTrades)
+            ? options!.recentTrades.map(trade => ({
+                venue: trade.venue,
+                market_type: trade.marketType,
+                symbol: trade.symbol,
+                side: trade.side,
+                quantity: trade.quantity,
+                notional_usd: trade.notionalUsd,
+                realized_pnl_usd: trade.realizedPnlUsd,
+                tx_signature: trade.txSignature,
+                created_at: trade.createdAt,
+            }))
+            : [],
+        allocation_summary: options?.allocationSummary
+            ? {
+                perp_positions_count: options.allocationSummary.perpPositionsCount,
+                spot_positions_count: options.allocationSummary.spotPositionsCount,
+                spot_value_usd: options.allocationSummary.spotValueUsd,
+                total_unrealized_pnl_usd: options.allocationSummary.totalUnrealizedPnlUsd,
+                total_realized_pnl_usd: options.allocationSummary.totalRealizedPnlUsd,
+                latest_trade_symbol: options.allocationSummary.latestTradeSymbol,
+                latest_trade_side: options.allocationSummary.latestTradeSide,
+                latest_trade_venue: options.allocationSummary.latestTradeVenue,
+            }
+            : null,
     };
 }
 
@@ -1357,7 +1404,42 @@ export class AirificaServer {
 
         const writePacificaKnowledgeCache = (walletAddress: string, overview: Awaited<ReturnType<typeof buildPacificaOverview>>) => {
             const entry = getOrCreatePacificaKnowledgeEntry(walletAddress);
-            entry.knowledge = JSON.stringify(sanitizePacificaKnowledgePayload(overview), null, 2);
+            const tradeLedger = this.stateStore.listTradeLedgerForWallet(walletAddress);
+            const recentTrades = tradeLedger.slice(0, 12).map(item => ({
+                venue: item.venue,
+                marketType: item.marketType,
+                symbol: item.symbol,
+                side: item.side,
+                quantity: Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : null,
+                notionalUsd: Number.isFinite(Number(item.notionalUsd)) ? Number(item.notionalUsd) : null,
+                realizedPnlUsd: Number.isFinite(Number(item.realizedPnlUsd)) ? Number(item.realizedPnlUsd) : null,
+                txSignature: item.txSignature || null,
+                createdAt: Number(item.createdAt || item.updatedAt || Date.now()),
+            }));
+            const onchainPositions = Array.isArray((overview as any).onchainPositions) ? (overview as any).onchainPositions : [];
+            const realizedPnlUsd = tradeLedger.reduce((sum, item) => sum + Number(item.realizedPnlUsd || 0), 0);
+            const perpUnrealizedPnlUsd = (Array.isArray(overview.positions) ? overview.positions : []).reduce(
+                (sum, position) => sum + Number(position.unrealizedPnlUsd || 0),
+                0,
+            );
+            const onchainUnrealizedPnlUsd = onchainPositions.reduce(
+                (sum: number, position: any) => sum + Number(position.unrealizedPnlUsd || 0),
+                0,
+            );
+            const latestTrade = tradeLedger[0] || null;
+            entry.knowledge = JSON.stringify(sanitizePacificaKnowledgePayload(overview, {
+                recentTrades,
+                allocationSummary: {
+                    perpPositionsCount: Array.isArray(overview.positions) ? overview.positions.length : 0,
+                    spotPositionsCount: onchainPositions.length,
+                    spotValueUsd: onchainPositions.reduce((sum: number, position: any) => sum + Number(position.valueUsd || 0), 0),
+                    totalUnrealizedPnlUsd: perpUnrealizedPnlUsd + onchainUnrealizedPnlUsd,
+                    totalRealizedPnlUsd: realizedPnlUsd,
+                    latestTradeSymbol: latestTrade?.symbol || null,
+                    latestTradeSide: latestTrade?.side || null,
+                    latestTradeVenue: latestTrade?.venue || null,
+                },
+            }), null, 2);
             entry.updatedAt = Date.now();
             entry.lastAccessAt = Date.now();
             return entry.knowledge;
@@ -1947,6 +2029,7 @@ export class AirificaServer {
                     `Opened ${proposal.proposal.side} ${proposal.proposal.symbol} from Airifica${orderId ? ` (${orderId})` : ""}.`,
                     "TRADE_OPENED",
                 );
+                void maybePrimePacificaKnowledge(walletAddress);
 
                 return {
                     ok: true,
@@ -2424,6 +2507,7 @@ export class AirificaServer {
                     notionalUsd: Number.isFinite(amountUsd) ? amountUsd : 0,
                     source: "web",
                 });
+                void maybePrimePacificaKnowledge(auth.address);
                 res.json({
                     ok: true,
                     queued: notifications.length,
@@ -3317,6 +3401,7 @@ export class AirificaServer {
                     `Closed ${result.side} ${result.symbol} position from Airifica frontend (${result.amount}).`,
                     "POSITION_CLOSED",
                 );
+                void maybePrimePacificaKnowledge(auth.address);
                 res.json({
                     ok: true,
                     closed: {
