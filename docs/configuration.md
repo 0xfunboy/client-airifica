@@ -1,98 +1,105 @@
 # Configuration
 
-The repository is branded `client-airifica`, but the current runtime contract still uses `AIRI3_*` variables for compatibility with the live Airifica web stack.
+`client-airifica` accepts both `AIRIFICA_*` and `AIRI3_*` names. The live stack still relies on the legacy `AIRI3_*` namespace, so the examples below keep that form.
 
-## Essential variables
+## Essential Variables
 
-These must be set in every real deployment:
+These must be set in any real deployment:
 
-- `AIRI3_AUTH_SECRET`
-- `AIRI3_ENCRYPTION_KEY`
-- `AIRI3_PUBLIC_APP_URL`
-- `PACIFICA_BUILDER_CODE`
-- `PACIFICA_API_BASE`
-- `AIRI3_PACIFICA_PUBLIC_API_BASE`
+| Variable | Required | Description |
+|---|---|---|
+| `AIRI3_AUTH_SECRET` | yes | Session signing secret for wallet-auth sessions |
+| `AIRI3_ENCRYPTION_KEY` | yes | 32-byte hex key for encrypting Pacifica agent keys |
+| `AIRI3_PUBLIC_APP_URL` | yes | Public browser URL used in auth prompts and deep links |
+| `PACIFICA_BUILDER_CODE` | yes | Builder code approved by the user |
+| `PACIFICA_API_BASE` | yes | Pacifica signed execution API base |
+| `AIRI3_PACIFICA_PUBLIC_API_BASE` | yes | Pacifica public market API base |
+| `SOLANA_RPC_URL` | strongly recommended | RPC endpoint used for onchain holdings sync |
 
-In production, set:
+## Server and Runtime
 
-- `AIRI3_CORS_ORIGIN`
-
-## Server
-
-- `AIRI3_PORT`
-  HTTP and WebSocket port for the client runtime.
-- `AIRI3_JSON_LIMIT`
-  JSON body size limit for Express.
-- `AIRI3_DATA_DIR`
-  Optional custom state directory for persistent bindings.
-- `AIRI3_CORS_ORIGIN`
-  Comma-separated origin allowlist for production browser traffic.
-- `AIRI3_PUBLIC_APP_URL`
-  Public app URL used in wallet signature challenges and mobile wallet flows.
+| Variable | Default | Description |
+|---|---|---|
+| `AIRI3_PORT` | `4040` | HTTP / WS runtime port |
+| `AIRI3_JSON_LIMIT` | `1mb` | Express body limit |
+| `AIRI3_DATA_DIR` | empty | Optional data directory override |
+| `AIRI3_CORS_ORIGIN` | empty | Explicit allowlist for browser origins |
+| `AIRI3_PUBLIC_APP_URL` | empty | Public app URL used in auth and Telegram handoff |
 
 ## Auth
 
-- `AIRI3_AUTH_SECRET`
-  Session token signing secret.
-- `AIRI3_AUTH_ISSUER`
-  JWT issuer label.
-- `AIRI3_AUTH_AUDIENCE`
-  JWT audience label.
-- `AIRI3_AUTH_TOKEN_TTL_MS`
-  Session token lifetime.
-- `AIRI3_NONCE_TTL_MS`
-  Wallet challenge nonce lifetime.
-- `AIRI3_ENCRYPTION_KEY`
-  32-byte hex key used to encrypt Pacifica agent private keys at rest.
+| Variable | Default | Description |
+|---|---|---|
+| `AIRI3_AUTH_SECRET` | — | JWT signing secret |
+| `AIRI3_AUTH_ISSUER` | `airifica` | Token issuer |
+| `AIRI3_AUTH_AUDIENCE` | `airifica-clients` | Token audience |
+| `AIRI3_AUTH_TOKEN_TTL_MS` | `86400000` | Session lifetime |
+| `AIRI3_NONCE_TTL_MS` | `300000` | Wallet challenge TTL |
+| `AIRI3_ENCRYPTION_KEY` | — | 64 hex chars required for encrypted agent wallet state |
 
-## Message and action timeouts
+## Timeouts
 
-- `AIRI3_ACTION_VALIDATE_TIMEOUT_MS`
-- `AIRI3_ACTION_HANDLER_TIMEOUT_MS`
-- `AIRI3_LLM_TIMEOUT_MS`
-- `AIRI3_EVALUATION_TIMEOUT_MS`
-- `AIRI3_TRADE_PARSER_TIMEOUT_MS`
-
-These values control the async guardrails around validation, action execution, LLM response generation, evaluation, and trade setup parsing.
+| Variable | Default | Description |
+|---|---|---|
+| `AIRI3_ACTION_VALIDATE_TIMEOUT_MS` | `8000` | Action validation guardrail |
+| `AIRI3_ACTION_HANDLER_TIMEOUT_MS` | `45000` | Action handler timeout |
+| `AIRI3_LLM_TIMEOUT_MS` | `25000` | LLM response timeout |
+| `AIRI3_EVALUATION_TIMEOUT_MS` | `5000` | Evaluation timeout |
+| `AIRI3_TRADE_PARSER_TIMEOUT_MS` | `15000` | Trade parser timeout |
 
 ## Pacifica
 
-- `PACIFICA_BUILDER_CODE`
-  Builder code approved by the end user.
-- `AIRI3_PACIFICA_BUILDER_MAX_FEE_RATE`
-  Max fee rate requested in the builder approval payload.
-- `PACIFICA_API_BASE`
-  Signed-action base URL.
-- `AIRI3_PACIFICA_PUBLIC_API_BASE`
-  Public Pacifica market data base URL.
-- `AIRI3_PACIFICA_MARKET_LOT_SIZE`
-  Legacy fallback lot size if market metadata is unavailable.
-- `AIRI3_PACIFICA_MIN_DEPOSIT_USD`
-  Minimum deposit hint shown in the UI.
-- `AIRI3_DEFAULT_NOTIONAL_USD`
-  Default fallback sizing used when a proposal does not carry explicit collateral.
-- `AIRI3_PACIFICA_BETA_ACCESS_URL`
-  URL shown when Pacifica rejects trading because beta access is not redeemed yet.
-- `AUTO_PACIFICA_API_KEY`
-  Optional Pacifica API key if your tenant uses one.
-- `AUTO_PACIFICA_EXPIRY_MS`
-  Expiry window used in signed Pacifica payloads.
+| Variable | Default | Description |
+|---|---|---|
+| `PACIFICA_BUILDER_CODE` | — | Builder code used during approval |
+| `AIRI3_PACIFICA_BUILDER_MAX_FEE_RATE` | `0.001` | Fee rate requested in builder approval |
+| `PACIFICA_API_BASE` | `https://api.pacifica.fi` | Pacifica signed-action base |
+| `AIRI3_PACIFICA_PUBLIC_API_BASE` | `https://api.pacifica.fi/api/v1` | Public Pacifica data base |
+| `AIRI3_PACIFICA_MARKET_LOT_SIZE` | `0.00001` | Fallback lot size when metadata is missing |
+| `AIRI3_PACIFICA_MIN_DEPOSIT_USD` | `10` | UX hint for minimum account funding |
+| `AIRI3_DEFAULT_NOTIONAL_USD` | `100` | Default fallback notional |
+| `AIRI3_PACIFICA_BETA_ACCESS_URL` | `https://app.pacifica.fi/portfolio` | Redeem page shown on beta gate |
+| `AUTO_PACIFICA_API_KEY` | empty | Optional tenant key |
+| `AUTO_PACIFICA_EXPIRY_MS` | `60000` | Signed payload expiry |
 
-## Caches
+## Cache and Market Metadata
 
-- `PACIFICA_SYMBOLS_TTL_MS`
-  Market universe refresh interval.
-- `AIRI3_EXTERNAL_MARKET_CACHE_TTL_MS`
-  External ticker / contract-address fallback cache TTL for DexScreener and GeckoTerminal.
-- `AIRI3_PACIFICA_CONTEXT_CACHE_MS`
-  Live account context refresh interval.
-- `AIRI3_PACIFICA_CONTEXT_IDLE_MS`
-  Idle eviction window for cached account state.
+| Variable | Default | Description |
+|---|---|---|
+| `PACIFICA_SYMBOLS_TTL_MS` | `21600000` | Market universe TTL |
+| `AIRI3_EXTERNAL_MARKET_CACHE_TTL_MS` | `30000` | External market metadata fallback TTL |
+| `AIRI3_PACIFICA_CONTEXT_CACHE_MS` | `5000` | Live account snapshot refresh interval |
+| `AIRI3_PACIFICA_CONTEXT_IDLE_MS` | `120000` | Idle eviction window for account cache |
+| `AIRI3_ONCHAIN_PORTFOLIO_SYNC_MS` | `300000` | Onchain holdings sync interval |
+| `AIRI3_ONCHAIN_PORTFOLIO_IDLE_MS` | `900000` | Idle eviction window for wallet sync jobs |
+| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | RPC endpoint used for wallet holdings sync |
 
-## Recommended production baseline
+## Telegram and Linking
 
-- keep `AIRI3_CORS_ORIGIN` explicit
-- set `AIRI3_PUBLIC_APP_URL` to the public domain used by the browser
-- keep `PACIFICA_API_BASE` and `AIRI3_PACIFICA_PUBLIC_API_BASE` on the official Pacifica endpoints
-- never commit populated values for `AIRI3_AUTH_SECRET` or `AIRI3_ENCRYPTION_KEY`
-- rotate the encryption key carefully, because existing stored agent wallet bindings depend on it
+| Variable | Default | Description |
+|---|---|---|
+| `AIRI3_TELEGRAM_BOT_USERNAME` | empty | Bot username used for deep links |
+| `AIRI3_TELEGRAM_BOT_TOKEN` | empty | Bot token if the runtime also owns Telegram start-up |
+| `AIRI3_TELEGRAM_INTERNAL_SECRET` | empty | Shared secret for internal Telegram callbacks |
+| `AIRI3_TELEGRAM_LINK_CODE_TTL_MS` | `600000` | One-click link code TTL |
+| `AIRI3_TELEGRAM_HEARTBEAT_STALE_MS` | `120000` | Heartbeat freshness threshold |
+
+## Jupiter / Spot Tracking
+
+| Variable | Default | Description |
+|---|---|---|
+| `AIRI3_JUPITER_TRIGGER_MIN_ORDER_USD` | `10` | Minimum USD size to arm Trigger TP/SL |
+
+## Admin
+
+| Variable | Default | Description |
+|---|---|---|
+| `AIRI3_ADMIN_WALLETS` | empty | Comma-separated allowlist for admin wallet addresses |
+
+## Production Baseline
+
+- set `AIRI3_CORS_ORIGIN` explicitly
+- use a dedicated `SOLANA_RPC_URL` instead of public shared RPC when possible
+- never commit populated secrets
+- keep `AIRI3_PUBLIC_APP_URL` aligned with the browser domain used in wallet signing
+- rotate `AIRI3_ENCRYPTION_KEY` only with a migration plan, because bound Pacifica wallet material depends on it

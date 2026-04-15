@@ -1,97 +1,110 @@
 # Architecture
 
-`client-airifica` is the server-side bridge between the Airifica webapp and an active ElizaOS runtime.
+`client-airifica` is the runtime-side boundary between Airifica clients and the ElizaOS agent process.
 
-## Main runtime blocks
+## Main Blocks
 
-### Auth and session boundary
+### 1. Auth Boundary
 
-The client exposes a Solana signature challenge flow:
+The browser never gets direct privileged access.
+
+Auth flow:
 
 1. `POST /api/auth/challenge`
-2. wallet signature in the browser
+2. sign challenge with Solana wallet
 3. `POST /api/auth/verify`
-4. token-backed session access for the web agent
+4. receive scoped session token
 
-This is the boundary used by chat, history, Pacifica status, and execution routes.
+Every wallet-scoped route depends on that session token.
 
-### Message routing
+### 2. Conversation Runtime
 
-`/api/airi3/message` accepts the browser payload, rebuilds runtime state, then hands the message to the Eliza runtime through the internal message manager.
+`/api/airi3/message` rebuilds request context, injects wallet-specific state, and forwards the turn to the Airifica message manager.
 
-The message manager is responsible for:
+The message manager handles:
 
-- state composition
-- action routing
-- market / chart action shaping
-- trade proposal extraction
-- structured fallback handling
+- conversation fast paths
+- account-aware fast paths
+- action routing for market requests
+- proposal derivation
+- safe structured fallback behavior
 
-### Pacifica execution layer
+### 3. Market and Execution Layer
 
-The Pacifica layer manages:
+The runtime splits execution by venue:
 
-- builder approval payloads
-- agent wallet preparation
-- agent wallet binding
-- account overview
-- position snapshots
-- market order creation
-- position closing
+- **Pacifica** for supported perp assets
+- **Jupiter-linked spot** for supported Solana spot assets
+- **external info-only** for assets with analytics but no supported execution venue
 
-The server keeps Pacifica account context independent from the main chat request path so the web client does not need to fetch account state inline with every prompt.
+Market metadata is cached horizontally. Account state is cached per wallet.
 
-### Market universe cache
+### 4. Telegram Surface
 
-The client maintains a cached Pacifica market universe used for:
+The runtime also exposes internal Telegram endpoints for:
 
-- ticker selection in the UI
-- market metadata lookup
-- leverage / lot size / order sizing constraints
+- chat linking
+- live alert delivery
+- runtime heartbeat
+- positions / history / account panels
+- Telegram-native action menus
 
-This cache can be warmed on boot and refreshed on a longer TTL than account state.
+### 5. Persistence
 
-### Local state store
+The package uses the same SQLite runtime database as ElizaOS and stores Airifica-specific tables there for:
 
-The state store persists the data needed to reconnect user sessions and Pacifica bindings without forcing a full re-onboarding flow every time:
+- trade ledger
+- Telegram links and link codes
+- onchain spot snapshots
+- analytics counters
+- runtime heartbeats
+- wallet-specific runtime state
 
-- approved builder state
-- bound agent wallet address
-- encrypted agent wallet private key material
+## Isolation Model
 
-## Request flow
+Wallet state is injected strictly per wallet instance:
 
-### Chat
+- web requests only receive state for the authenticated wallet
+- Telegram requests only receive state for the wallet linked to that chat
+- no shared context blob is injected across wallets
 
-1. browser verifies wallet and creates a session
+This is the core safety boundary for allocation, positions, history, and execution context.
+
+## Request Flow
+
+### Web Chat
+
+1. wallet signs session
 2. browser posts `/api/airi3/session`
 3. browser posts `/api/airi3/message`
-4. client rebuilds runtime state
-5. ElizaOS generates a response
-6. response and optional proposal payload return to the webapp
+4. runtime injects wallet state from SQLite
+5. Eliza generates response and optional trade proposal
+6. browser renders response and trade controls
 
-### Pacifica onboarding
+### Pacifica Open
 
-1. browser requests `prepare-agent`
-2. client creates a dedicated agent wallet
-3. browser signs `approve_builder_code`
-4. browser signs `bind_agent_wallet`
-5. client stores the encrypted binding
-6. overview and position routes become available for the bound account
+1. proposal is approved
+2. runtime validates builder approval, account state, lot size, and collateral
+3. bound Pacifica agent wallet signs order
+4. trade ledger is updated
+5. Telegram and admin analytics can observe the event
 
-### Trade execution
+### Jupiter Spot
 
-1. browser submits a proposal approval request
-2. client validates account state, collateral, leverage, lot size, and builder approval
-3. client signs the Pacifica market order with the bound agent wallet
-4. Pacifica returns execution status
+1. frontend or Telegram handoff prepares spot trade
+2. wallet signs Jupiter transaction in the browser
+3. runtime receives execution notification
+4. onchain holdings snapshot and ledger are refreshed
+5. updated state becomes available to web, Telegram, and admin surfaces
 
-## Compatibility note
+## Why SQLite
 
-The repository name is `client-airifica`, but the live Airifica stack still depends on:
+Earlier JSON state was fast to ship, but not production-correct for:
 
-- `AIRI3_*` environment variables
-- `/api/airi3/*` route names
-- ElizaOS client key `airi3`
+- queryability
+- atomic writes
+- concurrent updates
+- admin analytics
+- history reconstruction
 
-Those names are preserved intentionally so the package can replace the previous runtime without requiring a frontend route migration.
+SQLite fixes those issues while staying lightweight and local to the runtime.

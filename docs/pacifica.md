@@ -1,94 +1,83 @@
-# Pacifica
+# Pacifica and Spot Execution
 
-`client-airifica` owns the server-side Pacifica execution flow used by the Airifica webapp.
+`client-airifica` handles two execution families:
 
-## Supported flows
+- **Pacifica perps**
+- **Jupiter-linked spot**
 
-### 1. Agent wallet preparation
+They share the same user-facing conversation and state layer, but they do not execute the same way.
 
-The runtime generates a dedicated agent wallet per user account and stores the private key encrypted at rest.
+## Pacifica
 
-Purpose:
+### Supported Flow
 
-- isolate execution from the user wallet
-- keep the user wallet only on approval / signature boundaries
-- allow the runtime to execute approved actions later through the bound agent wallet
+1. prepare agent wallet
+2. approve builder code
+3. bind agent wallet
+4. fetch live overview
+5. approve and submit market order
+6. close or manage open position
 
-### 2. Builder approval
+### Stored Runtime State
 
-The browser signs `approve_builder_code` for the configured builder code:
+The runtime persists:
 
-- `PACIFICA_BUILDER_CODE`
-- `AIRI3_PACIFICA_BUILDER_MAX_FEE_RATE`
-
-The runtime then submits that approval to Pacifica.
-
-### 3. Agent wallet binding
-
-The browser signs `bind_agent_wallet`, then the runtime binds the prepared agent wallet to the user account.
-
-### 4. Account overview
-
-The runtime exposes:
-
-- account equity
-- available balance
-- withdrawable balance
-- open positions
-- current market position detail
-- maker / taker fee and funding reference data
-
-### 5. Market universe
-
-The runtime maintains a cached universe of Pacifica markets used by the UI for:
-
-- manual token selection
-- leverage limits
-- lot size handling
-- market ordering by volume
-
-### 6. Order creation
-
-Proposal approval routes validate:
-
-- builder approval presence
-- beta access status
-- available collateral
-- leverage bounds
-- market lot size
-- bound agent wallet state
-
-After validation, the runtime submits Pacifica market orders using the bound agent wallet.
-
-### 7. Position close
-
-The runtime can submit market-close actions against current positions from the Airifica interface.
-
-## Server-side state
-
-The runtime stores the following binding data locally:
-
-- wallet address
-- bound agent wallet address
+- user wallet
+- agent wallet public key
 - encrypted agent wallet private key
 - builder approval snapshot
+- trade ledger and notifications
 
-This state must persist across restarts if you want users to reconnect without repeating the full Pacifica onboarding flow.
+### Validation Path
 
-## Operational guidance
+Before order submission the runtime validates:
 
-- keep market-universe caching separate from account-context caching
-- keep account state refresh separate from the main chat request path
-- do not treat Pacifica account overview as static metadata
-- never send orders if `collateral > available`
-- always quantize order size using live market metadata rather than a hardcoded symbol assumption
+- builder approval presence
+- beta access
+- collateral availability
+- leverage bounds
+- lot size constraints
+- bound wallet state
 
-## User-facing failure states
+## Jupiter-Linked Spot
 
-Important Pacifica failures should be mapped to structured UI states instead of raw API errors, especially:
+Spot execution is tracked under the same wallet-aware state system, but the order itself is signed by the user wallet in the browser.
+
+### Runtime Responsibilities
+
+- identify spot-supported assets
+- track onchain wallet holdings
+- persist spot ledger entries
+- notify Telegram and admin telemetry
+- track TP/SL intent and trigger linkage when available
+
+### Important Distinction
+
+For spot:
+
+- the runtime can track execution context and holdings
+- the browser wallet signs the swap transaction
+- TP/SL arm through separate Jupiter Trigger logic when supported and above minimum trigger size
+
+## Ledger and History
+
+Both Pacifica and Jupiter-linked spot feed the same wallet-scoped trade ledger.
+
+That ledger is then used for:
+
+- conversation context injection
+- Telegram history
+- admin overview
+- latest-trade summaries
+- allocation-aware assistant responses
+
+## Failure Handling
+
+Important execution failures should be mapped into structured states, not raw API blobs:
 
 - missing builder approval
-- missing beta access
-- account not activated
-- insufficient available collateral
-- symbol lot size mismatch
+- beta access required
+- collateral too low
+- lot size mismatch
+- trigger could not arm
+- notification delivery failed

@@ -1,0 +1,20 @@
+<svg width="1600" height="420" viewBox="0 0 1600 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#07131F"/>
+      <stop offset="1" stop-color="#10283A"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="200" y1="80" x2="1400" y2="320" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#57E3FF" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#1DD1A1" stop-opacity="0.18"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="420" rx="28" fill="url(#bg)"/>
+  <rect x="40" y="40" width="1520" height="340" rx="24" fill="url(#accent)" stroke="rgba(135,206,235,0.16)"/>
+  <circle cx="1290" cy="110" r="78" fill="#16A34A" fill-opacity="0.12"/>
+  <circle cx="1395" cy="250" r="116" fill="#229ED9" fill-opacity="0.10"/>
+  <path d="M88 306L162 112H214L288 306H238L223 265H151L137 306H88ZM164 225H210L187 155L164 225Z" fill="#FF6B5F"/>
+  <text x="360" y="168" fill="#F8FAFC" font-family="Arial, Helvetica, sans-serif" font-size="70" font-weight="700">client-airifica</text>
+  <text x="362" y="226" fill="#89A9BE" font-family="Arial, Helvetica, sans-serif" font-size="28">Web runtime bridge for wallet auth, Pacifica execution, Jupiter-linked spot tracking, and Telegram control flows</text>
+  <text x="362" y="292" fill="#D6F6FF" font-family="Arial, Helvetica, sans-serif" font-size="24">SQLite state • Wallet-scoped context injection • Admin telemetry • ElizaOS-compatible runtime surface</text>
+</svg>
