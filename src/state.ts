@@ -789,7 +789,17 @@ export class AirificaStateStore {
         return new Set(rows.map(row => String(row.name || "").trim()).filter(Boolean));
     }
 
+    private static readonly ALLOWED_TABLES = new Set([
+        "airifica_onchain_spot_watches",
+        "airifica_meta",
+    ]);
+
     private ensureColumn(tableName: string, columnName: string, columnDefinition: string) {
+        if (!AirificaStateStore.ALLOWED_TABLES.has(tableName))
+            throw new Error(`[AirificaStateStore] Refusing DDL on unknown table: ${tableName}`);
+        if (!/^[a-z_][a-z0-9_]*$/i.test(columnName))
+            throw new Error(`[AirificaStateStore] Invalid column name: ${columnName}`);
+
         const columns = this.getTableColumns(tableName);
         if (columns.has(columnName))
             return;

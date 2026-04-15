@@ -49,7 +49,10 @@ function envValue(name: string, fallback = "") {
     return process.env[`AIRIFICA_${name}`] ?? process.env[`AIRI3_${name}`] ?? fallback;
 }
 
-const DEFAULT_PORT = Number(envValue("PORT", "4040"));
+const _rawPort = Number(envValue("PORT", "4040"));
+if (!Number.isInteger(_rawPort) || _rawPort < 1 || _rawPort > 65535)
+    throw new Error(`[client-airifica] Invalid PORT value: "${envValue("PORT")}"`);
+const DEFAULT_PORT = _rawPort;
 const NODE_ENV = process.env.NODE_ENV || "development";
 const CORS_ORIGIN = envValue("CORS_ORIGIN");
 const MAX_JSON_BODY = envValue("JSON_LIMIT", "1mb");
@@ -72,7 +75,6 @@ const AIRIFICA_TELEGRAM_LINK_CODE_TTL_MS = Math.max(60_000, Number(envValue("TEL
 const AIRIFICA_TELEGRAM_HEARTBEAT_STALE_MS = Math.max(30_000, Number(envValue("TELEGRAM_HEARTBEAT_STALE_MS", "120000")));
 const AIRIFICA_TELEGRAM_INTERNAL_SECRET = String(
     envValue("TELEGRAM_INTERNAL_SECRET")
-    || envValue("TELEGRAM_BOT_TOKEN")
     || "",
 ).trim();
 const AIRIFICA_TELEGRAM_NOTIFY_BASE_URL = AIRIFICA_PUBLIC_APP_URL || null;
@@ -107,12 +109,43 @@ const privateNetworkOriginPattern = /^https?:\/\/(?:(?:localhost|127\.0\.0\.1)(?
 
 function isAllowedCorsOrigin(origin?: string | null) {
     if (!origin)
-        return true;
+        return NODE_ENV !== "production";
 
     if (configuredCorsOrigins.size > 0)
         return configuredCorsOrigins.has(origin);
 
     return NODE_ENV !== "production" && privateNetworkOriginPattern.test(origin);
+}
+
+// Simple in-memory rate limiter — keyed by (ip, endpoint), sliding window
+const _rateLimitBuckets = new Map<string, number[]>();
+function checkRateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+    const now = Date.now();
+    const hits = (_rateLimitBuckets.get(key) || []).filter(ts => now - ts < windowMs);
+    if (hits.length >= maxRequests)
+        return false;
+    hits.push(now);
+    _rateLimitBuckets.set(key, hits);
+    return true;
+}
+// Prune stale rate-limit buckets every 5 minutes
+setInterval(() => {
+    const cutoff = Date.now() - 120_000;
+    for (const [key, hits] of _rateLimitBuckets) {
+        const fresh = hits.filter(ts => ts > cutoff);
+        if (fresh.length === 0)
+            _rateLimitBuckets.delete(key);
+        else
+            _rateLimitBuckets.set(key, fresh);
+    }
+}, 5 * 60_000).unref?.();
+
+function getClientIp(req: Request): string {
+    return String(
+        (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
+        || req.socket?.remoteAddress
+        || "unknown",
+    );
 }
 
 function applySecurityHeaders(res: Response) {
@@ -729,6 +762,11 @@ export class AirificaServer {
     private setupRoutes() {
         this.app.post("/api/auth/challenge", async (req: Request, res: Response) => {
             try {
+                const ip = getClientIp(req);
+                if (!checkRateLimit(`challenge:${ip}`, 10, 60_000)) {
+                    res.status(429).json({ error: "Too many requests" });
+                    return;
+                }
                 pruneNonces();
                 const { address } = req.body ?? {};
                 if (!address) {
@@ -751,6 +789,11 @@ export class AirificaServer {
 
         this.app.post("/api/auth/verify", async (req: Request, res: Response) => {
             try {
+                const ip = getClientIp(req);
+                if (!checkRateLimit(`verify:${ip}`, 15, 60_000)) {
+                    res.status(429).json({ error: "Too many requests" });
+                    return;
+                }
                 pruneNonces();
                 const { message, signature, address } = req.body ?? {};
                 if (!message || !signature || !address) {
@@ -768,11 +811,13 @@ export class AirificaServer {
                     return;
                 }
                 if (!consumeNonce(parsed.nonce, address)) {
-                    res.status(401).json({ error: "Invalid or expired nonce" });
+                    elizaLogger.warn("[client-airifica] /api/auth/verify: invalid or expired nonce for", address);
+                    res.status(401).json({ error: "Unauthorized" });
                     return;
                 }
                 if (!verifySolanaSignature(address, message, signature)) {
-                    res.status(401).json({ error: "Signature verification failed" });
+                    elizaLogger.warn("[client-airifica] /api/auth/verify: signature verification failed for", address);
+                    res.status(401).json({ error: "Unauthorized" });
                     return;
                 }
 

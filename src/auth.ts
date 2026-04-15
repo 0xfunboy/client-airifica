@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { PublicKey } from '@solana/web3.js';
 
 function envValue(name: string, fallback = '') {
     return process.env[`AIRIFICA_${name}`] ?? process.env[`AIRI3_${name}`] ?? fallback;
@@ -102,8 +103,13 @@ export function base58Decode(value: string): Buffer | null {
 }
 
 export function isValidSolanaAddress(address: string) {
-    const decoded = base58Decode(String(address || '').trim());
-    return !!decoded && decoded.length === 32;
+    try {
+        new PublicKey(String(address || '').trim());
+        return true;
+    }
+    catch {
+        return false;
+    }
 }
 
 export function buildSolanaAuthMessage(address: string, nonce: string, host: string) {

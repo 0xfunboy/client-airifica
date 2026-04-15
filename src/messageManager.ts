@@ -368,11 +368,10 @@ export class AirificaMessageManager {
     }
 
     private extractExplicitTickers(text: string) {
+        // Cap input to prevent ReDoS and oversized prompt injection via ticker extraction
+        const capped = text.slice(0, 4096);
         const tickers = new Set<string>();
-        const upperText = text.toUpperCase();
-        let match: RegExpExecArray | null;
-        const pattern = new RegExp(EXPLICIT_TICKER_PATTERN);
-        while ((match = pattern.exec(upperText)) !== null) {
+        for (const match of capped.toUpperCase().matchAll(EXPLICIT_TICKER_PATTERN)) {
             const ticker = match[1]?.toUpperCase().trim();
             if (ticker && !MARKET_SYMBOL_STOPWORDS.has(ticker))
                 tickers.add(ticker);

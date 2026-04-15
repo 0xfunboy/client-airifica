@@ -227,6 +227,12 @@ function buildSyntheticCandles(price: number, timeframe: string, limit: number) 
     }));
 }
 
+function fetchWithTimeout(url: URL | string, init: RequestInit, timeoutMs = 12_000): Promise<Response> {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    return fetch(url, { ...init, signal: ac.signal }).finally(() => clearTimeout(timer));
+}
+
 async function fetchJson<T>(path: string, search?: Record<string, string>) {
     const url = new URL(`${PACIFICA_PUBLIC_API_BASE}${path}`);
     if (search) {
@@ -236,14 +242,14 @@ async function fetchJson<T>(path: string, search?: Record<string, string>) {
         });
     }
 
-    const response = await fetch(url, { method: 'GET' });
+    const response = await fetchWithTimeout(url, { method: 'GET' });
     if (!response.ok)
         throw new Error(`Pacifica public API ${path} ${response.status}`);
     return await response.json() as T;
 }
 
 async function fetchDexJson<T>(url: string) {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
         method: 'GET',
         headers: { accept: 'application/json' },
     });
@@ -263,7 +269,7 @@ async function fetchGeckoJson<T>(path: string, search?: Record<string, string>) 
         }
     }
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
         method: 'GET',
         headers: { accept: 'application/json' },
     });
